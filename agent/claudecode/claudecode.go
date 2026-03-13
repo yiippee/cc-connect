@@ -101,7 +101,9 @@ func normalizePermissionMode(raw string) string {
 	}
 }
 
-func (a *Agent) Name() string { return "claudecode" }
+func (a *Agent) Name() string           { return "claudecode" }
+func (a *Agent) CLIBinaryName() string  { return "claude" }
+func (a *Agent) CLIDisplayName() string { return "Claude" }
 
 func (a *Agent) SetModel(model string) {
 	a.mu.Lock()
@@ -687,6 +689,52 @@ func summarizeInput(tool string, input any) string {
 	return string(b)
 }
 
+// parseUserQuestions extracts structured questions from AskUserQuestion input.
+func parseUserQuestions(input map[string]any) []core.UserQuestion {
+	questionsRaw, ok := input["questions"].([]any)
+	if !ok || len(questionsRaw) == 0 {
+		return nil
+	}
+	var questions []core.UserQuestion
+	for _, qRaw := range questionsRaw {
+		qMap, ok := qRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		q := core.UserQuestion{
+			Question:    strVal(qMap, "question"),
+			Header:      strVal(qMap, "header"),
+			MultiSelect: boolVal(qMap, "multiSelect"),
+		}
+		if optsRaw, ok := qMap["options"].([]any); ok {
+			for _, oRaw := range optsRaw {
+				oMap, ok := oRaw.(map[string]any)
+				if !ok {
+					continue
+				}
+				q.Options = append(q.Options, core.UserQuestionOption{
+					Label:       strVal(oMap, "label"),
+					Description: strVal(oMap, "description"),
+				})
+			}
+		}
+		if q.Question != "" {
+			questions = append(questions, q)
+		}
+	}
+	return questions
+}
+
+func strVal(m map[string]any, key string) string {
+	v, _ := m[key].(string)
+	return v
+}
+
+func boolVal(m map[string]any, key string) bool {
+	v, _ := m[key].(bool)
+	return v
+}
+
 // findProjectDir locates the Claude Code session directory for a given work dir.
 // Claude Code stores sessions at ~/.claude/projects/{projectKey}/ where projectKey
 // is derived from the absolute path. On Windows, the key format may vary (colon
@@ -695,12 +743,15 @@ func summarizeInput(tool string, input any) string {
 func findProjectDir(homeDir, absWorkDir string) string {
 	projectsBase := filepath.Join(homeDir, ".claude", "projects")
 
-	// Build candidate keys: different ways Claude Code might encode the path
+	// Build candidate keys: different ways Claude Code might encode the path.
+	// Claude Code replaces path separators, colons, and underscores with "-".
 	candidates := []string{
 		// Unix-style: replace OS separator with "-"
 		strings.ReplaceAll(absWorkDir, string(filepath.Separator), "-"),
 		// Windows: replace both "\" and ":" with "-"
 		strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(absWorkDir),
+		// Claude Code also replaces underscores with "-"
+		strings.NewReplacer("/", "-", "\\", "-", ":", "-", "_", "-").Replace(absWorkDir),
 	}
 	// Also try with forward slashes (config might use forward slashes on Windows)
 	fwd := strings.ReplaceAll(absWorkDir, "\\", "/")
@@ -720,7 +771,7 @@ func findProjectDir(homeDir, absWorkDir string) string {
 		return ""
 	}
 
-	normWork := strings.ToLower(strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(absWorkDir))
+	normWork := strings.ToLower(strings.NewReplacer("/", "-", "\\", "-", ":", "-", "_", "-").Replace(absWorkDir))
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue

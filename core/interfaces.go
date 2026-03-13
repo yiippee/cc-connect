@@ -103,6 +103,25 @@ type InlineButtonSender interface {
 	SendWithButtons(ctx context.Context, replyCtx any, content string, buttons [][]ButtonOption) error
 }
 
+// CardSender is an optional interface for platforms that support sending
+// structured rich cards (e.g. Feishu Interactive Card). Platforms that do not
+// implement this interface will receive a plain-text fallback via Card.RenderText().
+type CardSender interface {
+	SendCard(ctx context.Context, replyCtx any, card *Card) error
+	ReplyCard(ctx context.Context, replyCtx any, card *Card) error
+}
+
+// CardNavigationHandler is called by platforms to render a card for in-place
+// card updates (e.g. Feishu card.action.trigger callback). The action string
+// uses prefixes like "nav:/model" or "act:/model 3".
+type CardNavigationHandler func(action string, sessionKey string) *Card
+
+// CardNavigable is an optional interface for platforms that support in-place
+// card navigation (updating the existing card instead of sending a new message).
+type CardNavigable interface {
+	SetCardNavigationHandler(h CardNavigationHandler)
+}
+
 // MessageHandler is called by platforms when a new message arrives.
 type MessageHandler func(p Platform, msg *Message)
 
@@ -119,8 +138,8 @@ type Agent interface {
 
 // AgentSession represents a running interactive agent session with a persistent process.
 type AgentSession interface {
-	// Send sends a user message (with optional images) to the running agent process.
-	Send(prompt string, images []ImageAttachment) error
+	// Send sends a user message (with optional images and files) to the running agent process.
+	Send(prompt string, images []ImageAttachment, files []FileAttachment) error
 	// RespondPermission sends a permission decision back to the agent process.
 	RespondPermission(requestID string, result PermissionResult) error
 	// Events returns the channel that emits agent events (kept open across turns).
@@ -188,10 +207,59 @@ type ModelSwitcher interface {
 	AvailableModels(ctx context.Context) []ModelOption
 }
 
+// ReasoningEffortSwitcher is an optional interface for agents that support
+// runtime switching of reasoning effort.
+type ReasoningEffortSwitcher interface {
+	SetReasoningEffort(effort string)
+	GetReasoningEffort() string
+	AvailableReasoningEfforts() []string
+}
+
 // ModelOption describes a selectable model.
 type ModelOption struct {
 	Name string // model identifier passed to CLI
 	Desc string // short description (display_name or empty)
+}
+
+// UsageReporter is an optional interface for agents that can report account or
+// model quota usage from their backing provider.
+type UsageReporter interface {
+	GetUsage(ctx context.Context) (*UsageReport, error)
+}
+
+// UsageReport is a provider-neutral quota snapshot returned by UsageReporter.
+type UsageReport struct {
+	Provider  string
+	AccountID string
+	UserID    string
+	Email     string
+	Plan      string
+	Buckets   []UsageBucket
+	Credits   *UsageCredits
+}
+
+// UsageBucket groups one logical quota, such as standard requests or code review.
+type UsageBucket struct {
+	Name         string
+	Allowed      bool
+	LimitReached bool
+	Windows      []UsageWindow
+}
+
+// UsageWindow describes a single quota window.
+type UsageWindow struct {
+	Name              string
+	UsedPercent       int
+	WindowSeconds     int
+	ResetAfterSeconds int
+	ResetAtUnix       int64
+}
+
+// UsageCredits contains optional credit/balance metadata.
+type UsageCredits struct {
+	HasCredits bool
+	Unlimited  bool
+	Balance    string
 }
 
 // ContextCompressor is an optional interface for agents that support
@@ -248,4 +316,10 @@ type BotCommandInfo struct {
 // registering commands to the platform's native menu (e.g. Telegram's setMyCommands).
 type CommandRegistrar interface {
 	RegisterCommands(commands []BotCommandInfo) error
+}
+
+// ChannelNameResolver is an optional interface for platforms that can resolve
+// channel IDs to human-readable names.
+type ChannelNameResolver interface {
+	ResolveChannelName(channelID string) (string, error)
 }

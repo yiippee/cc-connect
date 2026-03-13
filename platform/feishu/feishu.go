@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -16,12 +18,19 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkcontact "github.com/larksuite/oapi-sdk-go/v3/service/contact/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
 func init() {
-	core.RegisterPlatform("feishu", New)
+	core.RegisterPlatform("feishu", func(opts map[string]any) (core.Platform, error) {
+		return newPlatform("feishu", lark.FeishuBaseUrl, opts)
+	})
+	core.RegisterPlatform("lark", func(opts map[string]any) (core.Platform, error) {
+		return newPlatform("lark", lark.LarkBaseUrl, opts)
+	})
 }
 
 type replyContext struct {
@@ -30,8 +39,12 @@ type replyContext struct {
 }
 
 type Platform struct {
+	platformName          string
+	domain                string
 	appID                 string
 	appSecret             string
+	useInteractiveCard    bool
+	self                  core.Platform
 	reactionEmoji         string
 	allowFrom             string
 	groupReplyAll         bool
@@ -40,16 +53,30 @@ type Platform struct {
 	client                *lark.Client
 	wsClient              *larkws.Client
 	handler               core.MessageHandler
+	cardNavHandler        core.CardNavigationHandler
 	cancel                context.CancelFunc
 	dedup                 core.MessageDedup
 	botOpenID             string
+	userNameCache         sync.Map // open_id -> display name
+}
+
+type interactivePlatform struct {
+	*Platform
+}
+
+func (p *Platform) SetCardNavigationHandler(h core.CardNavigationHandler) {
+	p.cardNavHandler = h
 }
 
 func New(opts map[string]any) (core.Platform, error) {
+	return newPlatform("feishu", lark.FeishuBaseUrl, opts)
+}
+
+func newPlatform(name, domain string, opts map[string]any) (core.Platform, error) {
 	appID, _ := opts["app_id"].(string)
 	appSecret, _ := opts["app_secret"].(string)
 	if appID == "" || appSecret == "" {
-		return nil, fmt.Errorf("feishu: app_id and app_secret are required")
+		return nil, fmt.Errorf("%s: app_id and app_secret are required", name)
 	}
 	reactionEmoji, _ := opts["reaction_emoji"].(string)
 	if reactionEmoji == "" {
@@ -59,48 +86,77 @@ func New(opts map[string]any) (core.Platform, error) {
 		reactionEmoji = ""
 	}
 	allowFrom, _ := opts["allow_from"].(string)
+	core.CheckAllowFrom(name, allowFrom)
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	replyInThread, _ := opts["reply_in_thread"].(bool)
+	useInteractiveCard := true
+	if v, ok := opts["enable_feishu_card"].(bool); ok {
+		useInteractiveCard = v
+	}
 
-	return &Platform{
+	var clientOpts []lark.ClientOptionFunc
+	if domain != lark.FeishuBaseUrl {
+		clientOpts = append(clientOpts, lark.WithOpenBaseUrl(domain))
+	}
+
+	base := &Platform{
+		platformName:          name,
+		domain:                domain,
 		appID:                 appID,
 		appSecret:             appSecret,
+		useInteractiveCard:    useInteractiveCard,
 		reactionEmoji:         reactionEmoji,
 		allowFrom:             allowFrom,
 		groupReplyAll:         groupReplyAll,
 		shareSessionInChannel: shareSessionInChannel,
 		replyInThread:         replyInThread,
-		client:                lark.NewClient(appID, appSecret),
-	}, nil
+		client:                lark.NewClient(appID, appSecret, clientOpts...),
+	}
+	if !useInteractiveCard {
+		base.self = base
+		return base, nil
+	}
+	wrapped := &interactivePlatform{Platform: base}
+	base.self = wrapped
+	return wrapped, nil
 }
 
-func (p *Platform) Name() string { return "feishu" }
+func (p *Platform) Name() string { return p.platformName }
+
+func (p *Platform) tag() string { return p.platformName }
+
+func (p *Platform) dispatchPlatform() core.Platform {
+	if p.self != nil {
+		return p.self
+	}
+	return p
+}
 
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 
 	if openID, err := p.fetchBotOpenID(); err != nil {
-		slog.Warn("feishu: failed to get bot open_id, group chat filtering disabled", "error", err)
+		slog.Warn(p.platformName+": failed to get bot open_id, group chat filtering disabled", "error", err)
 	} else {
 		p.botOpenID = openID
-		slog.Info("feishu: bot identified", "open_id", openID)
+		slog.Info(p.platformName+": bot identified", "open_id", openID)
 	}
 
 	eventHandler := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
-			slog.Debug("feishu: message received", "app_id", p.appID)
+			slog.Debug(p.platformName+": message received", "app_id", p.appID)
 			return p.onMessage(event)
 		}).
 		OnP2MessageReadV1(func(ctx context.Context, event *larkim.P2MessageReadV1) error {
 			return nil // ignore read receipts
 		}).
 		OnP2ChatAccessEventBotP2pChatEnteredV1(func(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
-			slog.Debug("feishu: user opened bot chat", "app_id", p.appID)
+			slog.Debug(p.platformName+": user opened bot chat", "app_id", p.appID)
 			return nil
 		}).
 		OnP1P2PChatCreatedV1(func(ctx context.Context, event *larkim.P1P2PChatCreatedV1) error {
-			slog.Debug("feishu: p2p chat created", "app_id", p.appID)
+			slog.Debug(p.platformName+": p2p chat created", "app_id", p.appID)
 			return nil
 		}).
 		OnP2MessageReactionCreatedV1(func(ctx context.Context, event *larkim.P2MessageReactionCreatedV1) error {
@@ -108,23 +164,168 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}).
 		OnP2MessageReactionDeletedV1(func(ctx context.Context, event *larkim.P2MessageReactionDeletedV1) error {
 			return nil // ignore reaction removal events (triggered by our own removeReaction)
+		}).
+		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			return p.onCardAction(event)
 		})
 
-	p.wsClient = larkws.NewClient(p.appID, p.appSecret,
+	wsOpts := []larkws.ClientOption{
 		larkws.WithEventHandler(eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
-	)
+	}
+	if p.domain != lark.FeishuBaseUrl {
+		wsOpts = append(wsOpts, larkws.WithDomain(p.domain))
+	}
+	p.wsClient = larkws.NewClient(p.appID, p.appSecret, wsOpts...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 
 	go func() {
 		if err := p.wsClient.Start(ctx); err != nil {
-			slog.Error("feishu: websocket error", "error", err)
+			slog.Error(p.tag()+": websocket error", "error", err)
 		}
 	}()
 
 	return nil
+}
+
+// onCardAction handles card.action.trigger callbacks via the official SDK event dispatcher.
+// Three prefixes are supported:
+//   - nav:/xxx   — render a card page and update the original card in-place
+//   - act:/xxx   — execute an action, then render and update the card in-place
+//   - cmd:/xxx   — legacy: dispatch as a user command (sends a new message)
+func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	if event.Event == nil || event.Event.Action == nil {
+		return nil, nil
+	}
+
+	actionVal, _ := event.Event.Action.Value["action"].(string)
+
+	// select_static callbacks put the chosen value in event.Event.Action.Option
+	if actionVal == "" && event.Event.Action.Option != "" {
+		actionVal = event.Event.Action.Option
+	}
+
+	userID := ""
+	if event.Event.Operator != nil {
+		userID = event.Event.Operator.OpenID
+	}
+	chatID := ""
+	messageID := ""
+	if event.Event.Context != nil {
+		chatID = event.Event.Context.OpenChatID
+		messageID = event.Event.Context.OpenMessageID
+	}
+	if chatID == "" {
+		chatID = userID
+	}
+	sessionKey := fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+
+	// nav: / act: — synchronous card update
+	if strings.HasPrefix(actionVal, "nav:") || strings.HasPrefix(actionVal, "act:") {
+		if p.cardNavHandler != nil {
+			card := p.cardNavHandler(actionVal, sessionKey)
+			if card != nil {
+				return &callback.CardActionTriggerResponse{
+					Card: &callback.Card{
+						Type: "raw",
+						Data: renderCardMap(card),
+					},
+				}, nil
+			}
+		}
+		slog.Warn(p.tag()+": card nav returned nil, ignoring", "action", actionVal)
+		return nil, nil
+	}
+
+	// perm: — permission response with in-place card update
+	if strings.HasPrefix(actionVal, "perm:") {
+		var responseText string
+		switch actionVal {
+		case "perm:allow":
+			responseText = "allow"
+		case "perm:deny":
+			responseText = "deny"
+		case "perm:allow_all":
+			responseText = "allow all"
+		default:
+			return nil, nil
+		}
+
+		rctx := replyContext{messageID: messageID, chatID: chatID}
+		go p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey,
+			Platform:   p.platformName,
+			UserID:     userID,
+			Content:    responseText,
+			ReplyCtx:   rctx,
+		})
+
+		permLabel, _ := event.Event.Action.Value["perm_label"].(string)
+		permColor, _ := event.Event.Action.Value["perm_color"].(string)
+		permBody, _ := event.Event.Action.Value["perm_body"].(string)
+		if permColor == "" {
+			permColor = "green"
+		}
+		cb := core.NewCard().Title(permLabel, permColor)
+		if permBody != "" {
+			cb.Markdown(permBody)
+		}
+		return &callback.CardActionTriggerResponse{
+			Card: &callback.Card{
+				Type: "raw",
+				Data: renderCardMap(cb.Build()),
+			},
+		}, nil
+	}
+
+	// askq: — AskUserQuestion option selected, forward as user message
+	if strings.HasPrefix(actionVal, "askq:") {
+		rctx := replyContext{messageID: messageID, chatID: chatID}
+		go p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey,
+			Platform:   p.platformName,
+			UserID:     userID,
+			Content:    actionVal,
+			ReplyCtx:   rctx,
+		})
+
+		answerLabel, _ := event.Event.Action.Value["askq_label"].(string)
+		askqQuestion, _ := event.Event.Action.Value["askq_question"].(string)
+		if answerLabel == "" {
+			answerLabel = actionVal
+		}
+		cb := core.NewCard().Title("✅ "+answerLabel, "green")
+		if askqQuestion != "" {
+			cb.Markdown(askqQuestion)
+		}
+		cb.Markdown("**→ " + answerLabel + "**")
+		return &callback.CardActionTriggerResponse{
+			Card: &callback.Card{
+				Type: "raw",
+				Data: renderCardMap(cb.Build()),
+			},
+		}, nil
+	}
+
+	// cmd: — async command dispatch
+	if strings.HasPrefix(actionVal, "cmd:") {
+		cmdText := strings.TrimPrefix(actionVal, "cmd:")
+		rctx := replyContext{messageID: messageID, chatID: chatID}
+
+		slog.Info(p.tag()+": card action dispatched as command", "cmd", cmdText, "user", userID)
+
+		go p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey,
+			Platform:   p.platformName,
+			UserID:     userID,
+			Content:    cmdText,
+			ReplyCtx:   rctx,
+		})
+	}
+
+	return nil, nil
 }
 
 func (p *Platform) addReaction(messageID string) string {
@@ -140,11 +341,11 @@ func (p *Platform) addReaction(messageID string) string {
 				Build()).
 			Build())
 	if err != nil {
-		slog.Debug("feishu: add reaction failed", "error", err)
+		slog.Debug(p.tag()+": add reaction failed", "error", err)
 		return ""
 	}
 	if !resp.Success() {
-		slog.Debug("feishu: add reaction failed", "code", resp.Code, "msg", resp.Msg)
+		slog.Debug(p.tag()+": add reaction failed", "code", resp.Code, "msg", resp.Msg)
 		return ""
 	}
 	if resp.Data != nil && resp.Data.ReactionId != nil {
@@ -163,11 +364,11 @@ func (p *Platform) removeReaction(messageID, reactionID string) {
 			ReactionId(reactionID).
 			Build())
 	if err != nil {
-		slog.Debug("feishu: remove reaction failed", "error", err)
+		slog.Debug(p.tag()+": remove reaction failed", "error", err)
 		return
 	}
 	if !resp.Success() {
-		slog.Debug("feishu: remove reaction failed", "code", resp.Code, "msg", resp.Msg)
+		slog.Debug(p.tag()+": remove reaction failed", "code", resp.Code, "msg", resp.Msg)
 	}
 }
 
@@ -212,7 +413,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 	}
 
 	if p.dedup.IsDuplicate(messageID) {
-		slog.Debug("feishu: duplicate message ignored", "message_id", messageID)
+		slog.Debug(p.tag()+": duplicate message ignored", "message_id", messageID)
 		return nil
 	}
 
@@ -220,7 +421,7 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 		if ms, err := strconv.ParseInt(*msg.CreateTime, 10, 64); err == nil {
 			msgTime := time.Unix(ms/1000, (ms%1000)*int64(time.Millisecond))
 			if core.IsOldMessage(msgTime) {
-				slog.Debug("feishu: ignoring old message after restart", "create_time", *msg.CreateTime)
+				slog.Debug(p.tag()+": ignoring old message after restart", "create_time", *msg.CreateTime)
 				return nil
 			}
 		}
@@ -233,26 +434,26 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 
 	if chatType == "group" && !p.groupReplyAll && p.botOpenID != "" {
 		if !isBotMentioned(msg.Mentions, p.botOpenID) {
-			slog.Debug("feishu: ignoring group message without bot mention", "chat_id", chatID)
+			slog.Debug(p.tag()+": ignoring group message without bot mention", "chat_id", chatID)
 			return nil
 		}
 	}
 
 	if !core.AllowList(p.allowFrom, userID) {
-		slog.Debug("feishu: message from unauthorized user", "user", userID)
+		slog.Debug(p.tag()+": message from unauthorized user", "user", userID)
 		return nil
 	}
 
-	if msg.Content == nil {
-		slog.Debug("feishu: message content is nil", "message_id", messageID, "type", msgType)
+	if msg.Content == nil && msgType != "merge_forward" {
+		slog.Debug(p.tag()+": message content is nil", "message_id", messageID, "type", msgType)
 		return nil
 	}
 
 	var sessionKey string
 	if p.shareSessionInChannel {
-		sessionKey = fmt.Sprintf("feishu:%s", chatID)
+		sessionKey = fmt.Sprintf("%s:%s", p.tag(), chatID)
 	} else {
-		sessionKey = fmt.Sprintf("feishu:%s:%s", chatID, userID)
+		sessionKey = fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
 	}
 	rctx := replyContext{messageID: messageID, chatID: chatID}
 
@@ -262,17 +463,17 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 			Text string `json:"text"`
 		}
 		if err := json.Unmarshal([]byte(*msg.Content), &textBody); err != nil {
-			slog.Error("feishu: failed to parse text content", "error", err)
+			slog.Error(p.tag()+": failed to parse text content", "error", err)
 			return nil
 		}
-		text := stripMentions(textBody.Text, msg.Mentions)
+		text := stripMentions(textBody.Text, msg.Mentions, p.botOpenID)
 		if text == "" {
 			return nil
 		}
-		p.handler(p, &core.Message{
-			SessionKey: sessionKey, Platform: "feishu",
+		p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID: userID, UserName: userName,
+			UserID:    userID, UserName: userName,
 			Content: text, ReplyCtx: rctx,
 		})
 
@@ -281,19 +482,19 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 			ImageKey string `json:"image_key"`
 		}
 		if err := json.Unmarshal([]byte(*msg.Content), &imgBody); err != nil {
-			slog.Error("feishu: failed to parse image content", "error", err)
+			slog.Error(p.tag()+": failed to parse image content", "error", err)
 			return nil
 		}
 		imgData, mimeType, err := p.downloadImage(messageID, imgBody.ImageKey)
 		if err != nil {
-			slog.Error("feishu: download image failed", "error", err)
+			slog.Error(p.tag()+": download image failed", "error", err)
 			return nil
 		}
-		p.handler(p, &core.Message{
-			SessionKey: sessionKey, Platform: "feishu",
+		p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID: userID, UserName: userName,
-			Images:  []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
+			UserID:    userID, UserName: userName,
+			Images:   []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 			ReplyCtx: rctx,
 		})
 
@@ -303,19 +504,19 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 			Duration int    `json:"duration"` // milliseconds
 		}
 		if err := json.Unmarshal([]byte(*msg.Content), &audioBody); err != nil {
-			slog.Error("feishu: failed to parse audio content", "error", err)
+			slog.Error(p.tag()+": failed to parse audio content", "error", err)
 			return nil
 		}
-		slog.Debug("feishu: audio received", "user", userID, "file_key", audioBody.FileKey)
+		slog.Debug(p.tag()+": audio received", "user", userID, "file_key", audioBody.FileKey)
 		audioData, err := p.downloadResource(messageID, audioBody.FileKey, "file")
 		if err != nil {
-			slog.Error("feishu: download audio failed", "error", err)
+			slog.Error(p.tag()+": download audio failed", "error", err)
 			return nil
 		}
-		p.handler(p, &core.Message{
-			SessionKey: sessionKey, Platform: "feishu",
+		p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID: userID, UserName: userName,
+			UserID:    userID, UserName: userName,
 			Audio: &core.AudioAttachment{
 				MimeType: "audio/opus",
 				Data:     audioData,
@@ -327,29 +528,286 @@ func (p *Platform) onMessage(event *larkim.P2MessageReceiveV1) error {
 
 	case "post":
 		textParts, images := p.parsePostContent(messageID, *msg.Content)
-		text := stripMentions(strings.Join(textParts, "\n"), msg.Mentions)
+		text := stripMentions(strings.Join(textParts, "\n"), msg.Mentions, p.botOpenID)
 		if text == "" && len(images) == 0 {
 			return nil
 		}
-		p.handler(p, &core.Message{
-			SessionKey: sessionKey, Platform: "feishu",
+		p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID: userID, UserName: userName,
+			UserID:    userID, UserName: userName,
 			Content: text, Images: images,
 			ReplyCtx: rctx,
 		})
 
+	case "file":
+		var fileBody struct {
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+		}
+		if err := json.Unmarshal([]byte(*msg.Content), &fileBody); err != nil {
+			slog.Error(p.tag()+": failed to parse file content", "error", err)
+			return nil
+		}
+		slog.Info(p.tag()+": file received", "user", userID, "file_key", fileBody.FileKey, "file_name", fileBody.FileName)
+		fileData, err := p.downloadResource(messageID, fileBody.FileKey, "file")
+		if err != nil {
+			slog.Error(p.tag()+": download file failed", "error", err)
+			return nil
+		}
+		slog.Debug(p.tag()+": file downloaded", "file_name", fileBody.FileName, "size", len(fileData))
+		mimeType := detectMimeType(fileData)
+		p.handler(p.dispatchPlatform(), &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName,
+			Files: []core.FileAttachment{{
+				MimeType: mimeType,
+				Data:     fileData,
+				FileName: fileBody.FileName,
+			}},
+			ReplyCtx: rctx,
+		})
+
+	case "merge_forward":
+		text, images, files := p.parseMergeForward(messageID)
+		if text == "" && len(images) == 0 && len(files) == 0 {
+			slog.Warn(p.tag()+": merge_forward produced no content", "message_id", messageID)
+			return nil
+		}
+		coreMsg := &core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName,
+			Content:  text,
+			Images:   images,
+			Files:    files,
+			ReplyCtx: rctx,
+		}
+		p.handler(p.dispatchPlatform(), coreMsg)
+
 	default:
-		slog.Debug("feishu: ignoring unsupported message type", "type", msgType)
+		slog.Debug(p.tag()+": ignoring unsupported message type", "type", msgType)
 	}
 
 	return nil
 }
 
+// resolveUserName fetches a user's display name via the Contact API, with caching.
+func (p *Platform) resolveUserName(openID string) string {
+	if cached, ok := p.userNameCache.Load(openID); ok {
+		return cached.(string)
+	}
+	resp, err := p.client.Contact.User.Get(context.Background(),
+		larkcontact.NewGetUserReqBuilder().
+			UserId(openID).
+			UserIdType("open_id").
+			Build())
+	if err != nil {
+		slog.Debug(p.tag()+": resolve user name failed", "open_id", openID, "error", err)
+		return openID
+	}
+	if !resp.Success() || resp.Data == nil || resp.Data.User == nil || resp.Data.User.Name == nil {
+		slog.Debug(p.tag()+": resolve user name: no data", "open_id", openID, "code", resp.Code)
+		return openID
+	}
+	name := *resp.Data.User.Name
+	p.userNameCache.Store(openID, name)
+	return name
+}
+
+// resolveUserNames batch-resolves open_ids to display names.
+func (p *Platform) resolveUserNames(openIDs []string) map[string]string {
+	names := make(map[string]string, len(openIDs))
+	for _, id := range openIDs {
+		if _, ok := names[id]; !ok {
+			names[id] = p.resolveUserName(id)
+		}
+	}
+	return names
+}
+
+// parseMergeForward fetches sub-messages of a merge_forward message via the
+// GET /open-apis/im/v1/messages/{message_id} API, then formats them into
+// readable text. Returns combined text, images, and files from the sub-messages.
+func (p *Platform) parseMergeForward(rootMessageID string) (string, []core.ImageAttachment, []core.FileAttachment) {
+	resp, err := p.client.Im.Message.Get(context.Background(),
+		larkim.NewGetMessageReqBuilder().
+			MessageId(rootMessageID).
+			Build())
+	if err != nil {
+		slog.Error(p.tag()+": fetch merge_forward sub-messages failed", "error", err)
+		return "", nil, nil
+	}
+	if !resp.Success() {
+		slog.Error(p.tag()+": fetch merge_forward sub-messages failed", "code", resp.Code, "msg", resp.Msg)
+		return "", nil, nil
+	}
+	if resp.Data == nil || len(resp.Data.Items) == 0 {
+		slog.Warn(p.tag()+": merge_forward has no sub-messages", "message_id", rootMessageID)
+		return "", nil, nil
+	}
+
+	items := resp.Data.Items
+	slog.Info(p.tag()+": merge_forward sub-messages fetched", "message_id", rootMessageID, "count", len(items))
+
+	// Build tree: group children by upper_message_id, collect sender IDs
+	childrenMap := make(map[string][]*larkim.Message)
+	senderIDs := make(map[string]struct{})
+	for _, item := range items {
+		if item.MessageId != nil && *item.MessageId == rootMessageID {
+			continue // skip root container
+		}
+		parentID := ""
+		if item.UpperMessageId != nil {
+			parentID = *item.UpperMessageId
+		}
+		if parentID == "" || parentID == rootMessageID {
+			parentID = rootMessageID
+		}
+		childrenMap[parentID] = append(childrenMap[parentID], item)
+		if item.Sender != nil && item.Sender.Id != nil {
+			senderIDs[*item.Sender.Id] = struct{}{}
+		}
+	}
+
+	// Resolve sender IDs to display names
+	uniqueIDs := make([]string, 0, len(senderIDs))
+	for id := range senderIDs {
+		uniqueIDs = append(uniqueIDs, id)
+	}
+	nameMap := p.resolveUserNames(uniqueIDs)
+
+	var allImages []core.ImageAttachment
+	var allFiles []core.FileAttachment
+	var sb strings.Builder
+	sb.WriteString("<forwarded_messages>\n")
+	p.formatMergeForwardTree(rootMessageID, childrenMap, nameMap, &sb, &allImages, &allFiles, 0)
+	sb.WriteString("</forwarded_messages>")
+
+	return sb.String(), allImages, allFiles
+}
+
+// replaceMentions replaces @_user_N placeholders with real names from the Mentions list.
+func replaceMentions(text string, mentions []*larkim.Mention) string {
+	for _, m := range mentions {
+		if m.Key != nil && m.Name != nil {
+			text = strings.ReplaceAll(text, *m.Key, "@"+*m.Name)
+		}
+	}
+	return text
+}
+
+// formatMergeForwardTree recursively formats the sub-message tree.
+func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[string][]*larkim.Message, nameMap map[string]string, sb *strings.Builder, images *[]core.ImageAttachment, files *[]core.FileAttachment, depth int) {
+	if depth > 10 {
+		sb.WriteString(strings.Repeat("    ", depth) + "[nested forwarding truncated]\n")
+		return
+	}
+	children := childrenMap[parentID]
+	indent := strings.Repeat("    ", depth)
+
+	for _, item := range children {
+		msgID := ""
+		if item.MessageId != nil {
+			msgID = *item.MessageId
+		}
+		msgType := ""
+		if item.MsgType != nil {
+			msgType = *item.MsgType
+		}
+		senderID := ""
+		if item.Sender != nil && item.Sender.Id != nil {
+			senderID = *item.Sender.Id
+		}
+		senderName := senderID
+		if name, ok := nameMap[senderID]; ok {
+			senderName = name
+		}
+
+		// Format timestamp
+		ts := ""
+		if item.CreateTime != nil {
+			if ms, err := strconv.ParseInt(*item.CreateTime, 10, 64); err == nil {
+				ts = time.Unix(ms/1000, 0).Format("2006-01-02 15:04:05")
+			}
+		}
+
+		content := ""
+		if item.Body != nil && item.Body.Content != nil {
+			content = *item.Body.Content
+		}
+
+		switch msgType {
+		case "text":
+			var textBody struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(content), &textBody); err == nil && textBody.Text != "" {
+				msgText := replaceMentions(textBody.Text, item.Mentions)
+				sb.WriteString(fmt.Sprintf("%s[%s] %s:\n", indent, ts, senderName))
+				for _, line := range strings.Split(msgText, "\n") {
+					sb.WriteString(fmt.Sprintf("%s    %s\n", indent, line))
+				}
+			}
+
+		case "post":
+			textParts, postImages := p.parsePostContent(msgID, content)
+			*images = append(*images, postImages...)
+			text := replaceMentions(strings.Join(textParts, "\n"), item.Mentions)
+			if text != "" {
+				sb.WriteString(fmt.Sprintf("%s[%s] %s:\n", indent, ts, senderName))
+				for _, line := range strings.Split(text, "\n") {
+					sb.WriteString(fmt.Sprintf("%s    %s\n", indent, line))
+				}
+			}
+
+		case "image":
+			var imgBody struct {
+				ImageKey string `json:"image_key"`
+			}
+			if err := json.Unmarshal([]byte(content), &imgBody); err == nil && imgBody.ImageKey != "" {
+				imgData, mimeType, err := p.downloadImage(msgID, imgBody.ImageKey)
+				if err != nil {
+					slog.Error(p.tag()+": download merge_forward image failed", "error", err)
+					sb.WriteString(fmt.Sprintf("%s[%s] %s: [image - download failed]\n", indent, ts, senderName))
+				} else {
+					*images = append(*images, core.ImageAttachment{MimeType: mimeType, Data: imgData})
+					sb.WriteString(fmt.Sprintf("%s[%s] %s: [image]\n", indent, ts, senderName))
+				}
+			}
+
+		case "file":
+			var fileBody struct {
+				FileKey  string `json:"file_key"`
+				FileName string `json:"file_name"`
+			}
+			if err := json.Unmarshal([]byte(content), &fileBody); err == nil && fileBody.FileKey != "" {
+				fileData, err := p.downloadResource(msgID, fileBody.FileKey, "file")
+				if err != nil {
+					slog.Error(p.tag()+": download merge_forward file failed", "error", err)
+					sb.WriteString(fmt.Sprintf("%s[%s] %s: [file: %s - download failed]\n", indent, ts, senderName, fileBody.FileName))
+				} else {
+					mt := detectMimeType(fileData)
+					*files = append(*files, core.FileAttachment{MimeType: mt, Data: fileData, FileName: fileBody.FileName})
+					sb.WriteString(fmt.Sprintf("%s[%s] %s: [file: %s]\n", indent, ts, senderName, fileBody.FileName))
+				}
+			}
+
+		case "merge_forward":
+			sb.WriteString(fmt.Sprintf("%s[%s] %s: [forwarded messages]\n", indent, ts, senderName))
+			p.formatMergeForwardTree(msgID, childrenMap, nameMap, sb, images, files, depth+1)
+
+		default:
+			sb.WriteString(fmt.Sprintf("%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType))
+		}
+	}
+}
+
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
-		return fmt.Errorf("feishu: invalid reply context type %T", rctx)
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
 
 	msgType, msgBody := buildReplyContent(content)
@@ -362,10 +820,10 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 			Build()).
 		Build())
 	if err != nil {
-		return fmt.Errorf("feishu: reply api call: %w", err)
+		return fmt.Errorf("%s: reply api call: %w", p.tag(), err)
 	}
 	if !resp.Success() {
-		return fmt.Errorf("feishu: reply failed code=%d msg=%s", resp.Code, resp.Msg)
+		return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 	}
 	return nil
 }
@@ -375,7 +833,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
-		return fmt.Errorf("feishu: invalid reply context type %T", rctx)
+		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
 
 	if p.replyInThread && rc.messageID != "" {
@@ -383,12 +841,11 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	}
 
 	if rc.chatID == "" {
-		return fmt.Errorf("feishu: chatID is empty, cannot send new message")
+		return fmt.Errorf("%s: chatID is empty, cannot send new message", p.tag())
 	}
 
 	msgType, msgBody := buildReplyContent(content)
 
-	// Send a new message to the chat (not a reply)
 	resp, err := p.client.Im.Message.Create(ctx, larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
@@ -398,15 +855,14 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 			Build()).
 		Build())
 	if err != nil {
-		return fmt.Errorf("feishu: send api call: %w", err)
+		return fmt.Errorf("%s: send api call: %w", p.tag(), err)
 	}
 	if !resp.Success() {
-		return fmt.Errorf("feishu: send failed code=%d msg=%s", resp.Code, resp.Msg)
+		return fmt.Errorf("%s: send failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 	}
 	return nil
 }
 
-// downloadImage fetches an image from Feishu by message_id and image_key.
 func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, error) {
 	resp, err := p.client.Im.MessageResource.Get(context.Background(),
 		larkim.NewGetMessageResourceReqBuilder().
@@ -415,22 +871,21 @@ func (p *Platform) downloadImage(messageID, imageKey string) ([]byte, string, er
 			Type("image").
 			Build())
 	if err != nil {
-		return nil, "", fmt.Errorf("feishu: image API: %w", err)
+		return nil, "", fmt.Errorf("%s: image API: %w", p.tag(), err)
 	}
 	if !resp.Success() {
-		return nil, "", fmt.Errorf("feishu: image API code=%d msg=%s", resp.Code, resp.Msg)
+		return nil, "", fmt.Errorf("%s: image API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 	}
 	data, err := io.ReadAll(resp.File)
 	if err != nil {
-		return nil, "", fmt.Errorf("feishu: read image: %w", err)
+		return nil, "", fmt.Errorf("%s: read image: %w", p.tag(), err)
 	}
 
 	mimeType := detectMimeType(data)
-	slog.Debug("feishu: downloaded image", "key", imageKey, "size", len(data), "mime", mimeType)
+	slog.Debug(p.tag()+": downloaded image", "key", imageKey, "size", len(data), "mime", mimeType)
 	return data, mimeType, nil
 }
 
-// downloadResource fetches a file resource (audio, etc.) from Feishu by message_id and file_key.
 func (p *Platform) downloadResource(messageID, fileKey, resType string) ([]byte, error) {
 	resp, err := p.client.Im.MessageResource.Get(context.Background(),
 		larkim.NewGetMessageResourceReqBuilder().
@@ -439,16 +894,16 @@ func (p *Platform) downloadResource(messageID, fileKey, resType string) ([]byte,
 			Type(resType).
 			Build())
 	if err != nil {
-		return nil, fmt.Errorf("feishu: resource API: %w", err)
+		return nil, fmt.Errorf("%s: resource API: %w", p.tag(), err)
 	}
 	if !resp.Success() {
-		return nil, fmt.Errorf("feishu: resource API code=%d msg=%s", resp.Code, resp.Msg)
+		return nil, fmt.Errorf("%s: resource API code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 	}
 	data, err := io.ReadAll(resp.File)
 	if err != nil {
-		return nil, fmt.Errorf("feishu: read resource: %w", err)
+		return nil, fmt.Errorf("%s: read resource: %w", p.tag(), err)
 	}
-	slog.Debug("feishu: downloaded resource", "key", fileKey, "type", resType, "size", len(data))
+	slog.Debug(p.tag()+": downloaded resource", "key", fileKey, "type", resType, "size", len(data))
 	return data, nil
 }
 
@@ -480,7 +935,7 @@ func buildReplyContent(content string) (msgType string, body string) {
 	// 2. Many \n\n paragraphs (help, status, etc.) → post rich-text (preserves blank lines)
 	// 3. Other markdown → post md tag (best native rendering)
 	if hasComplexMarkdown(content) {
-		return larkim.MsgTypeInteractive, buildCardJSON(preprocessFeishuMarkdown(content))
+		return larkim.MsgTypeInteractive, buildCardJSON(sanitizeMarkdownURLs(preprocessFeishuMarkdown(content)))
 	}
 	if strings.Count(content, "\n\n") >= 2 {
 		return larkim.MsgTypePost, buildPostJSON(content)
@@ -506,6 +961,7 @@ func hasComplexMarkdown(s string) bool {
 // buildPostMdJSON builds a Feishu post message using the md tag,
 // which renders markdown at normal chat font size.
 func buildPostMdJSON(content string) string {
+	content = sanitizeMarkdownURLs(content)
 	post := map[string]any{
 		"zh_cn": map[string]any{
 			"content": [][]map[string]any{
@@ -620,6 +1076,24 @@ func buildPostJSON(content string) string {
 // Feishu rejects non-HTTP(S) URLs with "invalid href" (code 230001).
 func isValidFeishuHref(u string) bool {
 	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
+}
+
+var mdLinkRe = regexp.MustCompile(`\[([^\]]*)\]\(([^)]+)\)`)
+
+// sanitizeMarkdownURLs rewrites markdown links with non-HTTP(S) schemes
+// to plain text, preventing Feishu API rejection (code 230001).
+func sanitizeMarkdownURLs(md string) string {
+	return mdLinkRe.ReplaceAllStringFunc(md, func(match string) string {
+		parts := mdLinkRe.FindStringSubmatch(match)
+		if len(parts) < 3 {
+			return match
+		}
+		if isValidFeishuHref(parts[2]) {
+			return match
+		}
+		// Convert invalid-scheme link to "text (url)" plain text
+		return parts[1] + " (" + parts[2] + ")"
+	})
 }
 
 // parseInlineMarkdown parses a single line of markdown into Feishu post elements.
@@ -785,14 +1259,22 @@ func isBotMentioned(mentions []*larkim.MentionEvent, botOpenID string) bool {
 	return false
 }
 
-// stripMentions removes @mention placeholders (e.g. @_user_1) from text
-// so that group-chat messages like "@Bot /help" become "/help".
-func stripMentions(text string, mentions []*larkim.MentionEvent) string {
+// stripMentions processes @mention placeholders (e.g. @_user_1) in text.
+// The bot's own mention is removed; other user mentions are replaced with
+// their display name so the agent can see who was referenced.
+func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID string) string {
 	if len(mentions) == 0 {
 		return text
 	}
 	for _, m := range mentions {
-		if m.Key != nil {
+		if m.Key == nil {
+			continue
+		}
+		if botOpenID != "" && m.Id != nil && m.Id.OpenId != nil && *m.Id.OpenId == botOpenID {
+			text = strings.ReplaceAll(text, *m.Key, "")
+		} else if m.Name != nil && *m.Name != "" {
+			text = strings.ReplaceAll(text, *m.Key, "@"+*m.Name)
+		} else {
 			text = strings.ReplaceAll(text, *m.Key, "")
 		}
 	}
@@ -800,10 +1282,10 @@ func stripMentions(text string, mentions []*larkim.MentionEvent) string {
 }
 
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
-	// feishu:{chatID}:{userID}
+	// {platformName}:{chatID}:{userID}
 	parts := strings.SplitN(sessionKey, ":", 3)
-	if len(parts) < 2 || parts[0] != "feishu" {
-		return nil, fmt.Errorf("feishu: invalid session key %q", sessionKey)
+	if len(parts) < 2 || parts[0] != p.platformName {
+		return nil, fmt.Errorf("%s: invalid session key %q", p.tag(), sessionKey)
 	}
 	return replyContext{chatID: parts[1]}, nil
 }
@@ -842,15 +1324,15 @@ func buildCardJSON(content string) string {
 func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content string) (any, error) {
 	rc, ok := rctx.(replyContext)
 	if !ok {
-		return nil, fmt.Errorf("feishu: invalid reply context type %T", rctx)
+		return nil, fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
 
 	chatID := rc.chatID
 	if chatID == "" {
-		return nil, fmt.Errorf("feishu: chatID is empty")
+		return nil, fmt.Errorf("%s: chatID is empty", p.tag())
 	}
 
-	cardJSON := buildCardJSON(content)
+	cardJSON := buildCardJSON(sanitizeMarkdownURLs(content))
 
 	var msgID string
 	if p.replyInThread && rc.messageID != "" {
@@ -862,10 +1344,10 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 				Build()).
 			Build())
 		if err != nil {
-			return nil, fmt.Errorf("feishu: send preview (reply): %w", err)
+			return nil, fmt.Errorf("%s: send preview (reply): %w", p.tag(), err)
 		}
 		if !resp.Success() {
-			return nil, fmt.Errorf("feishu: send preview (reply) code=%d msg=%s", resp.Code, resp.Msg)
+			return nil, fmt.Errorf("%s: send preview (reply) code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 		}
 		if resp.Data != nil && resp.Data.MessageId != nil {
 			msgID = *resp.Data.MessageId
@@ -880,10 +1362,10 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 				Build()).
 			Build())
 		if err != nil {
-			return nil, fmt.Errorf("feishu: send preview: %w", err)
+			return nil, fmt.Errorf("%s: send preview: %w", p.tag(), err)
 		}
 		if !resp.Success() {
-			return nil, fmt.Errorf("feishu: send preview code=%d msg=%s", resp.Code, resp.Msg)
+			return nil, fmt.Errorf("%s: send preview code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 		}
 		if resp.Data != nil && resp.Data.MessageId != nil {
 			msgID = *resp.Data.MessageId
@@ -891,7 +1373,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	}
 
 	if msgID == "" {
-		return nil, fmt.Errorf("feishu: send preview: no message ID returned")
+		return nil, fmt.Errorf("%s: send preview: no message ID returned", p.tag())
 	}
 
 	return &feishuPreviewHandle{messageID: msgID, chatID: chatID}, nil
@@ -902,14 +1384,14 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content string) error {
 	h, ok := previewHandle.(*feishuPreviewHandle)
 	if !ok {
-		return fmt.Errorf("feishu: invalid preview handle type %T", previewHandle)
+		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
 	}
 
 	processed := content
 	if containsMarkdown(content) {
 		processed = preprocessFeishuMarkdown(content)
 	}
-	cardJSON := buildCardJSON(processed)
+	cardJSON := buildCardJSON(sanitizeMarkdownURLs(processed))
 	resp, err := p.client.Im.Message.Patch(ctx, larkim.NewPatchMessageReqBuilder().
 		MessageId(h.messageID).
 		Body(larkim.NewPatchMessageReqBodyBuilder().
@@ -917,10 +1399,10 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 			Build()).
 		Build())
 	if err != nil {
-		return fmt.Errorf("feishu: patch message: %w", err)
+		return fmt.Errorf("%s: patch message: %w", p.tag(), err)
 	}
 	if !resp.Success() {
-		return fmt.Errorf("feishu: patch message code=%d msg=%s", resp.Code, resp.Msg)
+		return fmt.Errorf("%s: patch message code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 	}
 	return nil
 }
@@ -938,20 +1420,18 @@ func (p *Platform) Stop() error {
 func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
-		return fmt.Errorf("feishu: SendAudio: invalid reply context type %T", rctx)
+		return fmt.Errorf("%s: SendAudio: invalid reply context type %T", p.tag(), rctx)
 	}
 
-	// Feishu only supports opus for audio messages; convert if needed
 	if format != "opus" {
 		converted, err := core.ConvertAudioToOpus(ctx, audio, format)
 		if err != nil {
-			return fmt.Errorf("feishu: convert to opus: %w", err)
+			return fmt.Errorf("%s: convert to opus: %w", p.tag(), err)
 		}
 		audio = converted
 		format = "opus"
 	}
 
-	// Upload file to Feishu as opus
 	uploadResp, err := p.client.Im.File.Create(ctx,
 		larkim.NewCreateFileReqBuilder().
 			Body(larkim.NewCreateFileReqBodyBuilder().
@@ -961,23 +1441,22 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 				Build()).
 			Build())
 	if err != nil {
-		return fmt.Errorf("feishu: upload audio: %w", err)
+		return fmt.Errorf("%s: upload audio: %w", p.tag(), err)
 	}
 	if !uploadResp.Success() {
-		return fmt.Errorf("feishu: upload audio code=%d msg=%s", uploadResp.Code, uploadResp.Msg)
+		return fmt.Errorf("%s: upload audio code=%d msg=%s", p.tag(), uploadResp.Code, uploadResp.Msg)
 	}
 	if uploadResp.Data == nil || uploadResp.Data.FileKey == nil {
-		return fmt.Errorf("feishu: upload audio: no file_key returned")
+		return fmt.Errorf("%s: upload audio: no file_key returned", p.tag())
 	}
 	fileKey := *uploadResp.Data.FileKey
 
-	slog.Debug("feishu: audio uploaded", "file_key", fileKey, "format", format, "size", len(audio))
+	slog.Debug(p.tag()+": audio uploaded", "file_key", fileKey, "format", format, "size", len(audio))
 
-	// Build audio message content
 	audioMsg := larkim.MessageAudio{FileKey: fileKey}
 	audioContent, err := audioMsg.String()
 	if err != nil {
-		return fmt.Errorf("feishu: build audio message: %w", err)
+		return fmt.Errorf("%s: build audio message: %w", p.tag(), err)
 	}
 
 	// Send audio message to chat
@@ -990,10 +1469,10 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 			Build()).
 		Build())
 	if err != nil {
-		return fmt.Errorf("feishu: send audio message: %w", err)
+		return fmt.Errorf("%s: send audio message: %w", p.tag(), err)
 	}
 	if !sendResp.Success() {
-		return fmt.Errorf("feishu: send audio message code=%d msg=%s", sendResp.Code, sendResp.Msg)
+		return fmt.Errorf("%s: send audio message code=%d msg=%s", p.tag(), sendResp.Code, sendResp.Msg)
 	}
 	return nil
 }
@@ -1026,7 +1505,7 @@ func (p *Platform) parsePostContent(messageID, raw string) ([]string, []core.Ima
 			return p.extractPostParts(messageID, &lang)
 		}
 	}
-	slog.Error("feishu: failed to parse post content", "raw", raw)
+	slog.Error(p.tag()+": failed to parse post content", "raw", raw)
 	return nil, nil
 }
 
@@ -1051,7 +1530,7 @@ func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string,
 				if elem.ImageKey != "" {
 					imgData, mimeType, err := p.downloadImage(messageID, elem.ImageKey)
 					if err != nil {
-						slog.Error("feishu: download post image failed", "error", err, "key", elem.ImageKey)
+						slog.Error(p.tag()+": download post image failed", "error", err, "key", elem.ImageKey)
 						continue
 					}
 					images = append(images, core.ImageAttachment{MimeType: mimeType, Data: imgData})
@@ -1061,4 +1540,3 @@ func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string,
 	}
 	return textParts, images
 }
-

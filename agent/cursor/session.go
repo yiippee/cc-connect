@@ -33,6 +33,8 @@ type cursorSession struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	alive    atomic.Bool
+
+	thinkingBuf strings.Builder // accumulate thinking deltas
 }
 
 func newCursorSession(ctx context.Context, cmd, workDir, model, mode, resumeID string, extraEnv []string) (*cursorSession, error) {
@@ -57,9 +59,13 @@ func newCursorSession(ctx context.Context, cmd, workDir, model, mode, resumeID s
 	return cs, nil
 }
 
-func (cs *cursorSession) Send(prompt string, images []core.ImageAttachment) error {
+func (cs *cursorSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if len(images) > 0 {
 		slog.Warn("cursorSession: images not yet supported in CLI mode, ignoring")
+	}
+	if len(files) > 0 {
+		filePaths := core.SaveFilesToDisk(cs.workDir, files)
+		prompt = core.AppendFileRefs(prompt, filePaths)
 	}
 	if !cs.alive.Load() {
 		return fmt.Errorf("session is closed")
@@ -137,13 +143,15 @@ func (cs *cursorSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf
 	}()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
+
+		slog.Debug("cursorSession: raw", "line", truncateStr(line, 500))
 
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(line), &raw); err != nil {
@@ -184,6 +192,9 @@ func (cs *cursorSession) handleEvent(raw map[string]any) {
 	case "tool_call":
 		cs.handleToolCall(raw)
 
+	case "interaction_query":
+		cs.handleInteractionQuery(raw)
+
 	case "result":
 		cs.handleResult(raw)
 
@@ -209,12 +220,23 @@ func (cs *cursorSession) handleSystem(raw map[string]any) {
 
 func (cs *cursorSession) handleThinking(raw map[string]any) {
 	subtype, _ := raw["subtype"].(string)
-	if subtype == "delta" {
-		// Accumulate thinking deltas silently; we'll show them on "completed"
-		return
+	switch subtype {
+	case "delta":
+		if text, _ := raw["text"].(string); text != "" {
+			cs.thinkingBuf.WriteString(text)
+		}
+	default:
+		text := cs.thinkingBuf.String()
+		cs.thinkingBuf.Reset()
+		if text != "" {
+			evt := core.Event{Type: core.EventThinking, Content: text}
+			select {
+			case cs.events <- evt:
+			case <-cs.ctx.Done():
+				return
+			}
+		}
 	}
-	// "completed" — we don't emit thinking content to the chat
-	// (it's internal model reasoning, can be very verbose)
 }
 
 func (cs *cursorSession) handleAssistant(raw map[string]any) {
@@ -270,6 +292,57 @@ func (cs *cursorSession) handleToolCall(raw map[string]any) {
 	}
 }
 
+func (cs *cursorSession) handleInteractionQuery(raw map[string]any) {
+	subtype, _ := raw["subtype"].(string)
+	if subtype != "request" {
+		return
+	}
+
+	queryType, _ := raw["query_type"].(string)
+	query, _ := raw["query"].(map[string]any)
+	if query == nil {
+		return
+	}
+
+	toolName, input := extractInteractionQueryInfo(queryType, query)
+	if toolName == "" {
+		return
+	}
+
+	evt := core.Event{Type: core.EventToolUse, ToolName: toolName, ToolInput: input}
+	select {
+	case cs.events <- evt:
+	case <-cs.ctx.Done():
+		return
+	}
+}
+
+func extractInteractionQueryInfo(queryType string, query map[string]any) (string, string) {
+	switch queryType {
+	case "webFetchRequestQuery":
+		if inner, ok := query["webFetchRequestQuery"].(map[string]any); ok {
+			if args, ok := inner["args"].(map[string]any); ok {
+				url, _ := args["url"].(string)
+				return "WebFetch", url
+			}
+		}
+	case "shellRequestQuery":
+		if inner, ok := query["shellRequestQuery"].(map[string]any); ok {
+			if args, ok := inner["args"].(map[string]any); ok {
+				cmd, _ := args["command"].(string)
+				return "Bash", cmd
+			}
+		}
+	}
+
+	name := strings.TrimSuffix(queryType, "RequestQuery")
+	name = strings.TrimSuffix(name, "Query")
+	if name == "" {
+		name = queryType
+	}
+	return name, ""
+}
+
 // extractToolInfo parses the nested tool_call structure from Cursor's stream-json.
 // Tool calls can be shellToolCall, readToolCall, editToolCall, etc.
 func extractToolInfo(tc map[string]any) (name string, input string) {
@@ -285,6 +358,7 @@ func extractToolInfo(tc map[string]any) (name string, input string) {
 		{"searchToolCall", "Search"},
 		{"grepToolCall", "Grep"},
 		{"globToolCall", "Glob"},
+		{"webFetchToolCall", "WebFetch"},
 	}
 
 	for _, tt := range toolTypes {

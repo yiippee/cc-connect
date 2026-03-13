@@ -56,9 +56,13 @@ func newQoderSession(ctx context.Context, workDir, model, mode, resumeID string,
 	return qs, nil
 }
 
-func (qs *qoderSession) Send(prompt string, images []core.ImageAttachment) error {
+func (qs *qoderSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if len(images) > 0 {
 		slog.Warn("qoderSession: images not supported, ignoring")
+	}
+	if len(files) > 0 {
+		filePaths := core.SaveFilesToDisk(qs.workDir, files)
+		prompt = core.AppendFileRefs(prompt, filePaths)
 	}
 	if !qs.alive.Load() {
 		return fmt.Errorf("session is closed")
@@ -123,7 +127,7 @@ func (qs *qoderSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 	}()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()

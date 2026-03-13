@@ -20,25 +20,8 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/daemon"
 
-	_ "github.com/chenhg5/cc-connect/agent/claudecode"
-	_ "github.com/chenhg5/cc-connect/agent/codex"
-	_ "github.com/chenhg5/cc-connect/agent/cursor"
-	_ "github.com/chenhg5/cc-connect/agent/gemini"
-	_ "github.com/chenhg5/cc-connect/agent/iflow"
-	_ "github.com/chenhg5/cc-connect/agent/opencode"
-	_ "github.com/chenhg5/cc-connect/agent/qoder"
-
-	_ "github.com/chenhg5/cc-connect/platform/dingtalk"
-	_ "github.com/chenhg5/cc-connect/platform/discord"
-	_ "github.com/chenhg5/cc-connect/platform/feishu"
-	_ "github.com/chenhg5/cc-connect/platform/line"
-	_ "github.com/chenhg5/cc-connect/platform/qq"
-	_ "github.com/chenhg5/cc-connect/platform/slack"
-	_ "github.com/chenhg5/cc-connect/platform/telegram"
-	_ "github.com/chenhg5/cc-connect/platform/wecom"
-
-	_ "github.com/chenhg5/cc-connect/platform/qq"
-	_ "github.com/chenhg5/cc-connect/platform/qqbot"
+	// Agent and platform imports are in separate plugin_*.go files
+	// controlled by build tags. See Makefile for selective compilation.
 )
 
 var (
@@ -194,6 +177,22 @@ func main() {
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
 
+		// Wire multi-workspace mode
+		if proj.Mode == "multi-workspace" {
+			baseDir := proj.BaseDir
+			if strings.HasPrefix(baseDir, "~/") {
+				home, _ := os.UserHomeDir()
+				baseDir = filepath.Join(home, baseDir[2:])
+			}
+			if err := os.MkdirAll(baseDir, 0o755); err != nil {
+				slog.Error("failed to create base_dir", "path", baseDir, "err", err)
+				continue
+			}
+			bindingStore := filepath.Join(cfg.DataDir, "workspace_bindings.json")
+			engine.SetMultiWorkspace(baseDir, bindingStore)
+			slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
+		}
+
 		// Wire global custom commands
 		for _, c := range cfg.Commands {
 			engine.AddCommand(c.Name, c.Description, c.Prompt, c.Exec, c.WorkDir, "config")
@@ -227,6 +226,9 @@ func main() {
 		if len(proj.DisabledCommands) > 0 {
 			engine.SetDisabledCommands(proj.DisabledCommands)
 		}
+
+		// Wire admin allowlist for privileged commands
+		engine.SetAdminFrom(proj.AdminFrom)
 
 		// Wire display truncation settings
 		{
@@ -300,6 +302,11 @@ func main() {
 			engine.SetDefaultQuiet(*proj.Quiet)
 		} else if cfg.Quiet != nil {
 			engine.SetDefaultQuiet(*cfg.Quiet)
+		}
+
+		// Wire sender injection
+		if proj.InjectSender != nil {
+			engine.SetInjectSender(*proj.InjectSender)
 		}
 
 		// Wire speech-to-text if enabled
@@ -761,6 +768,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetDefaultQuiet(false)
 	}
 
+	// Reload sender injection
+	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
+
 	// Reload providers
 	if ps, ok := engine.GetAgent().(core.ProviderSwitcher); ok {
 		providers := make([]core.ProviderConfig, len(proj.Agent.Providers))
@@ -796,6 +806,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	// Reload disabled commands
 	engine.SetDisabledCommands(proj.DisabledCommands)
+
+	// Reload admin allowlist
+	engine.SetAdminFrom(proj.AdminFrom)
 
 	slog.Info("config reloaded", "project", projName)
 	return result, nil

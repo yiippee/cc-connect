@@ -136,7 +136,7 @@ func (cs *claudeSession) readLoop(stdout io.ReadCloser, stderrBuf *bytes.Buffer)
 	}()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -211,6 +211,9 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 		switch contentType {
 		case "tool_use":
 			toolName, _ := item["name"].(string)
+			if toolName == "AskUserQuestion" {
+				continue
+			}
 			inputSummary := summarizeInput(toolName, item["input"])
 			evt := core.Event{Type: core.EventToolUse, ToolName: toolName, ToolInput: inputSummary}
 			select {
@@ -314,6 +317,11 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 		ToolInput:    summarizeInput(toolName, input),
 		ToolInputRaw: input,
 	}
+
+	if toolName == "AskUserQuestion" {
+		evt.Questions = parseUserQuestions(input)
+	}
+
 	select {
 	case cs.events <- evt:
 	case <-cs.ctx.Done():
@@ -321,32 +329,33 @@ func (cs *claudeSession) handleControlRequest(raw map[string]any) {
 	}
 }
 
-// Send writes a user message (with optional images) to the Claude process stdin.
-// Images are saved to local temp files first, then sent as base64 in the
-// multimodal content array. File paths are also mentioned in the text prompt
-// as a fallback so Claude Code can read them with its built-in tools.
-func (cs *claudeSession) Send(prompt string, images []core.ImageAttachment) error {
+// Send writes a user message (with optional images and files) to the Claude process stdin.
+// Images are sent as base64 in the multimodal content array.
+// Files are saved to local temp files and referenced in the text prompt
+// so Claude Code can read them with its built-in tools.
+func (cs *claudeSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
 	if !cs.alive.Load() {
 		return fmt.Errorf("session process is not running")
 	}
 
-	if len(images) == 0 {
+	if len(images) == 0 && len(files) == 0 {
 		return cs.writeJSON(map[string]any{
 			"type":    "user",
 			"message": map[string]any{"role": "user", "content": prompt},
 		})
 	}
 
-	// Save images to local files and build multimodal content
-	imgDir := filepath.Join(cs.workDir, ".cc-connect", "images")
-	os.MkdirAll(imgDir, 0o755)
+	attachDir := filepath.Join(cs.workDir, ".cc-connect", "attachments")
+	os.MkdirAll(attachDir, 0o755)
 
 	var parts []map[string]any
 	var savedPaths []string
+
+	// Save and encode images
 	for i, img := range images {
 		ext := extFromMime(img.MimeType)
 		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(imgDir, fname)
+		fpath := filepath.Join(attachDir, fname)
 		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
 			slog.Error("claudeSession: save image failed", "error", err)
 			continue
@@ -368,13 +377,21 @@ func (cs *claudeSession) Send(prompt string, images []core.ImageAttachment) erro
 		})
 	}
 
-	// Build text part: user prompt + file path references as fallback
+	// Save files to disk so Claude Code can read them
+	filePaths := core.SaveFilesToDisk(cs.workDir, files)
+
+	// Build text part: user prompt + file path references
 	textPart := prompt
-	if textPart == "" {
+	if textPart == "" && len(filePaths) > 0 {
+		textPart = "Please analyze the attached file(s)."
+	} else if textPart == "" {
 		textPart = "Please analyze the attached image(s)."
 	}
 	if len(savedPaths) > 0 {
 		textPart += "\n\n(Images also saved locally: " + strings.Join(savedPaths, ", ") + ")"
+	}
+	if len(filePaths) > 0 {
+		textPart += "\n\n(Files saved locally, please read them: " + strings.Join(filePaths, ", ") + ")"
 	}
 	parts = append(parts, map[string]any{"type": "text", "text": textPart})
 

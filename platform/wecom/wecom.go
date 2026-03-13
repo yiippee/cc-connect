@@ -107,6 +107,11 @@ func (d *msgDedup) isDuplicate(msgID int64) bool {
 }
 
 func New(opts map[string]any) (core.Platform, error) {
+	mode, _ := opts["mode"].(string)
+	if mode == "websocket" {
+		return newWebSocket(opts)
+	}
+
 	corpID, _ := opts["corp_id"].(string)
 	corpSecret, _ := opts["corp_secret"].(string)
 	agentID, _ := opts["agent_id"].(string)
@@ -157,6 +162,7 @@ func New(opts map[string]any) (core.Platform, error) {
 
 	enableMarkdown, _ := opts["enable_markdown"].(bool)
 	allowFrom, _ := opts["allow_from"].(string)
+	core.CheckAllowFrom("wecom", allowFrom)
 
 	return &Platform{
 		corpID:         corpID,

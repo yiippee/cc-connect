@@ -42,6 +42,7 @@ func New(opts map[string]any) (core.Platform, error) {
 		return nil, fmt.Errorf("telegram: token is required")
 	}
 	allowFrom, _ := opts["allow_from"].(string)
+	core.CheckAllowFrom("telegram", allowFrom)
 
 	// Build HTTP client with optional proxy support
 	httpClient := &http.Client{Timeout: 60 * time.Second}
@@ -225,6 +226,31 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 					continue
 				}
 
+				// Handle document (file) messages
+				if msg.Document != nil {
+					slog.Info("telegram: document received", "user", userName, "file_name", msg.Document.FileName, "mime", msg.Document.MimeType, "file_id", msg.Document.FileID)
+					fileData, err := p.downloadFile(msg.Document.FileID)
+					if err != nil {
+						slog.Error("telegram: download document failed", "error", err)
+						continue
+					}
+					caption := msg.Caption
+					if p.bot.Self.UserName != "" {
+						caption = strings.ReplaceAll(caption, "@"+p.bot.Self.UserName, "")
+						caption = strings.TrimSpace(caption)
+					}
+					coreMsg := &core.Message{
+						SessionKey: sessionKey, Platform: "telegram",
+						UserID: userID, UserName: userName,
+						Content:   caption,
+						MessageID: strconv.Itoa(msg.MessageID),
+						Files:     []core.FileAttachment{{MimeType: msg.Document.MimeType, Data: fileData, FileName: msg.Document.FileName}},
+						ReplyCtx:  rctx,
+					}
+					p.handler(p, coreMsg)
+					continue
+				}
+
 				if msg.Text == "" {
 					continue
 				}
@@ -303,6 +329,43 @@ func (p *Platform) handleCallbackQuery(cb *tgbotapi.CallbackQuery) {
 			UserID:     userID,
 			UserName:   userName,
 			Content:    command,
+			MessageID:  strconv.Itoa(msgID),
+			ReplyCtx:   rctx,
+		})
+		return
+	}
+
+	// AskUserQuestion callbacks (askq:qIdx:optIdx)
+	if strings.HasPrefix(data, "askq:") {
+		// Extract label from after the last colon for display
+		parts := strings.SplitN(data, ":", 3)
+		choiceLabel := data
+		if len(parts) == 3 {
+			// Try to find the option label from the original message buttons
+			for _, row := range cb.Message.ReplyMarkup.InlineKeyboard {
+				for _, btn := range row {
+					if btn.CallbackData != nil && *btn.CallbackData == data {
+						choiceLabel = "✅ " + btn.Text
+					}
+				}
+			}
+		}
+
+		origText := cb.Message.Text
+		if origText == "" {
+			origText = "(question)"
+		}
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, origText+"\n\n"+choiceLabel)
+		emptyMarkup := tgbotapi.NewInlineKeyboardMarkup()
+		edit.ReplyMarkup = &emptyMarkup
+		p.bot.Send(edit)
+
+		p.handler(p, &core.Message{
+			SessionKey: sessionKey,
+			Platform:   "telegram",
+			UserID:     userID,
+			UserName:   userName,
+			Content:    data,
 			MessageID:  strconv.Itoa(msgID),
 			ReplyCtx:   rctx,
 		})
@@ -421,7 +484,7 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	html := core.MarkdownToTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	reply := tgbotapi.NewMessage(rc.chatID, html)
 	reply.ReplyToMessageID = rc.messageID
 	reply.ParseMode = tgbotapi.ModeHTML
@@ -446,7 +509,7 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("telegram: invalid reply context type %T", rctx)
 	}
 
-	html := core.MarkdownToTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	msg := tgbotapi.NewMessage(rc.chatID, html)
 	msg.ParseMode = tgbotapi.ModeHTML
 
@@ -479,7 +542,7 @@ func (p *Platform) SendWithButtons(ctx context.Context, rctx any, content string
 		rows = append(rows, btns)
 	}
 
-	html := core.MarkdownToTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	msg := tgbotapi.NewMessage(rc.chatID, html)
 	msg.ParseMode = tgbotapi.ModeHTML
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
@@ -521,7 +584,8 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 
 	resp, err := p.httpClient.Get(link)
 	if err != nil {
-		return nil, fmt.Errorf("download: %w", err)
+		errMsg := core.RedactToken(err.Error(), p.bot.Token)
+		return nil, fmt.Errorf("download file %s: %s", fileID, errMsg)
 	}
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
@@ -569,7 +633,7 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 		return fmt.Errorf("telegram: invalid preview handle type %T", previewHandle)
 	}
 
-	html := core.MarkdownToTelegramHTML(content)
+	html := core.MarkdownToSimpleHTML(content)
 	slog.Debug("telegram: UpdateMessage",
 		"content_len", len(content), "html_len", len(html),
 		"content_prefix", truncateForLog(content, 80),

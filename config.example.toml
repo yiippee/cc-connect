@@ -293,6 +293,29 @@ level = "info" # debug, info, warn, error
 #
 
 # =============================================================================
+# Multi-workspace Mode / 多工作区模式
+# =============================================================================
+# Single bot, multiple workspaces. Channel name maps to ~/workspace/<channel-name>
+# automatically. Use /workspace init <url> to clone and bind a new repo.
+# 单个 bot 服务多个工作区。频道名称自动映射到 ~/workspace/<频道名>。
+# 使用 /workspace init <url> 克隆并绑定新仓库。
+#
+# [[projects]]
+# name = "claude-multi"
+# mode = "multi-workspace"
+# base_dir = "~/workspace"
+#
+# [projects.agent]
+# type = "claudecode"
+# permission_mode = "yolo"
+#
+# [[projects.platforms]]
+# type = "slack"
+# [projects.platforms.options]
+# bot_token = "xoxb-..."
+# app_token = "xapp-..."
+
+# =============================================================================
 # Project 1 / 项目 1
 # =============================================================================
 
@@ -301,6 +324,23 @@ name = "my-backend"
 # quiet = true  # Override global quiet for this project / 覆盖全局静默模式
 # disabled_commands = ["restart", "upgrade", "cron"]  # Disable specific commands for this project
 #                                                     # 禁用该项目的指定命令
+#
+# admin_from controls who can run privileged commands (/shell, /restart, /upgrade, /commands addexec).
+# admin_from 控制谁可以执行特权命令（/shell, /restart, /upgrade, /commands addexec）。
+#
+# Not set (default): privileged commands are blocked for all users.
+# 未设置（默认）：所有用户均无法使用特权命令。
+#
+# Explicit user list: only these users can run privileged commands.
+# 指定用户列表：仅这些用户可执行特权命令。
+# admin_from = "user_id_1,user_id_2"
+#
+# ⚠️ RISK WARNING / 风险提示:
+# Setting admin_from = "*" grants ALL allowed users full shell access to the host machine.
+# Only use this for personal single-user deployments where you trust every allowed user.
+# 设置 admin_from = "*" 将授予所有已允许的用户对主机的完整 shell 访问权限。
+# 仅在个人单用户部署中使用此配置，确保所有允许的用户均可信任。
+# admin_from = "*"
 
 [projects.agent]
 type = "claudecode"
@@ -393,6 +433,8 @@ type = "feishu"
 [projects.platforms.options]
 app_id = "your-feishu-app-id"
 app_secret = "your-feishu-app-secret"
+# enable_feishu_card = true  # Enable Feishu interactive cards (default: true); set false to force plain-text replies
+#                              # 启用飞书交互式卡片（默认 true）；设为 false 时强制回退纯文本回复
 # allow_from = "*"          # Allowed user open_ids, comma-separated; "*" = all (default) / 允许的用户 open_id，逗号分隔；"*" 表示所有（默认）
 # reaction_emoji = "OnIt"  # Emoji reaction on incoming messages (default: "OnIt"); set to "none" to disable
 #                           # 收到消息时添加的表情回复（默认 "OnIt"）；设为 "none" 可禁用
@@ -544,6 +586,25 @@ app_secret = "your-feishu-app-secret"
 # proxy_username = ""  # optional: proxy authentication username / 代理认证用户名
 # proxy_password = ""  # optional: proxy authentication password / 代理认证密码
 
+# WeChat Work WebSocket / 企业微信长连接模式 (uncomment to enable / 取消注释以启用)
+# No public URL, no message encryption, no IP allowlist needed!
+# 无需公网 URL、无需消息加解密、无需 IP 白名单！
+# 1. Create a "智能机器人" (AI Bot) in WeChat Work admin console
+#    在企业微信管理后台创建「智能机器人」
+# 2. Get BotID and Secret / 获取 BotID 和 Secret
+# 3. Fill in config below / 填入下方配置
+# Connection: WebSocket long-connection (client-initiated, no public URL needed)
+# 连接方式：WebSocket 长连接（客户端主动连接，无需公网 URL）
+
+# [[projects.platforms]]
+# type = "wecom"
+#
+# [projects.platforms.options]
+# mode = "websocket"
+# bot_id = "your-bot-id"
+# bot_secret = "your-bot-secret"
+# allow_from = "*"  # Allowed user IDs / 允许的用户 ID
+
 # =============================================================================
 # Project 2: Using Cursor Agent / 项目 2：使用 Cursor Agent (uncomment to enable / 取消注释以启用)
 # =============================================================================
@@ -602,6 +663,7 @@ app_secret = "your-feishu-app-secret"
 # work_dir = "/path/to/project"
 # mode = "yolo"  # "default" | "auto_edit" | "yolo" | "plan"
 # cmd = "gemini" # CLI binary name (default: "gemini") / CLI 二进制名称（默认 "gemini"）
+# timeout_mins = 30  # 每次对话超时时间（分钟），0 表示不限制
 #
 # Mode options / 模式说明:
 # - "default":   Prompt for approval on each tool use / 每次工具调用都需要确认
@@ -655,6 +717,9 @@ app_secret = "your-feishu-app-secret"
 #
 # Optional: specify a model / 可选：指定模型
 # model = "o3"
+#
+# Optional: specify Codex reasoning effort / 可选：指定 Codex 推理强度
+# reasoning_effort = "high"  # "minimal" | "low" | "medium" | "high" | "xhigh"
 #
 # # Active provider / 当前激活的 provider
 # # provider = "openai"

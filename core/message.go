@@ -1,6 +1,10 @@
 package core
 
 import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -23,6 +27,25 @@ func MergeEnv(base, extra []string) []string {
 		merged = append(merged, e)
 	}
 	return append(merged, extra...)
+}
+
+// CheckAllowFrom logs a security warning at startup when allow_from is not
+// configured (defaults to permit-all). Platforms should call this during init.
+func CheckAllowFrom(platform, allowFrom string) {
+	if strings.TrimSpace(allowFrom) == "" {
+		slog.Warn("allow_from is not set — all users are permitted. "+
+			"Set allow_from in config to restrict access.",
+			"platform", platform)
+	}
+}
+
+// RedactToken replaces a secret token in text with [REDACTED] to prevent
+// token leakage in logs or error messages.
+func RedactToken(text, token string) string {
+	if token == "" || text == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, token, "[REDACTED]")
 }
 
 // AllowList checks whether a user ID is permitted based on a comma-separated
@@ -48,6 +71,51 @@ type ImageAttachment struct {
 	FileName string // original filename (optional)
 }
 
+// FileAttachment represents a file (PDF, doc, spreadsheet, etc.) sent by the user.
+type FileAttachment struct {
+	MimeType string // e.g. "application/pdf", "text/plain"
+	Data     []byte // raw file bytes
+	FileName string // original filename
+}
+
+// SaveFilesToDisk saves file attachments to workDir/.cc-connect/attachments/
+// and returns the list of absolute file paths. Agents can reference these paths
+// in their prompts so the CLI can read them with built-in tools.
+func SaveFilesToDisk(workDir string, files []FileAttachment) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+	os.MkdirAll(attachDir, 0o755)
+
+	var paths []string
+	for i, f := range files {
+		fname := f.FileName
+		if fname == "" {
+			fname = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
+		}
+		fpath := filepath.Join(attachDir, fname)
+		if err := os.WriteFile(fpath, f.Data, 0o644); err != nil {
+			slog.Error("SaveFilesToDisk: write failed", "error", err)
+			continue
+		}
+		paths = append(paths, fpath)
+		slog.Debug("SaveFilesToDisk: file saved", "path", fpath, "name", f.FileName, "mime", f.MimeType, "size", len(f.Data))
+	}
+	return paths
+}
+
+// AppendFileRefs appends file path references to a prompt string.
+func AppendFileRefs(prompt string, filePaths []string) string {
+	if len(filePaths) == 0 {
+		return prompt
+	}
+	if prompt == "" {
+		prompt = "Please analyze the attached file(s)."
+	}
+	return prompt + "\n\n(Files saved locally, please read them: " + strings.Join(filePaths, ", ") + ")"
+}
+
 // AudioAttachment represents a voice/audio message sent by the user.
 type AudioAttachment struct {
 	MimeType string // e.g. "audio/amr", "audio/ogg", "audio/mp4"
@@ -65,6 +133,7 @@ type Message struct {
 	UserName   string
 	Content    string
 	Images     []ImageAttachment // attached images (if any)
+	Files      []FileAttachment  // attached files (if any)
 	Audio      *AudioAttachment  // voice message (if any)
 	ReplyCtx   any               // platform-specific context needed for replying
 	FromVoice  bool              // true if message originated from voice transcription
@@ -83,6 +152,20 @@ const (
 	EventThinking          EventType = "thinking"           // thinking/processing status
 )
 
+// UserQuestion represents a structured question from AskUserQuestion.
+type UserQuestion struct {
+	Question    string             `json:"question"`
+	Header      string             `json:"header"`
+	Options     []UserQuestionOption `json:"options"`
+	MultiSelect bool               `json:"multiSelect"`
+}
+
+// UserQuestionOption is one choice in a UserQuestion.
+type UserQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
 // Event represents a single piece of agent output streamed back to the engine.
 type Event struct {
 	Type         EventType
@@ -93,6 +176,7 @@ type Event struct {
 	ToolResult   string         // populated for EventToolResult
 	SessionID    string         // agent-managed session ID for conversation continuity
 	RequestID    string         // unique request ID for EventPermissionRequest
+	Questions    []UserQuestion // populated when ToolName == "AskUserQuestion"
 	Done         bool
 	Error        error
 }

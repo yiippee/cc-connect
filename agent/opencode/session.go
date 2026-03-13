@@ -57,7 +57,11 @@ func newOpencodeSession(ctx context.Context, cmd, workDir, model, mode, resumeID
 	return s, nil
 }
 
-func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment) error {
+func (s *opencodeSession) Send(prompt string, images []core.ImageAttachment, files []core.FileAttachment) error {
+	if len(files) > 0 {
+		filePaths := core.SaveFilesToDisk(s.workDir, files)
+		prompt = core.AppendFileRefs(prompt, filePaths)
+	}
 	if !s.alive.Load() {
 		return fmt.Errorf("session is closed")
 	}
@@ -129,7 +133,7 @@ func (s *opencodeSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBu
 	}()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Text()
