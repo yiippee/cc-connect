@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cc-connect</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--text:#e0e0e0;--text-dim:#8a8a9a;--accent:#00d2ff;--user-bg:#0f3460;--ai-bg:#1e2a4a;--danger:#ff4757;--success:#2ed573;--border:#2a2a4a;--code-bg:#0d1117;--font-mono:'Cascadia Code','Fira Code','Consolas',monospace;--font-sans:-apple-system,'Segoe UI',Roboto,sans-serif}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:15px}
+#app{display:flex;flex-direction:column;height:100%;max-width:900px;margin:0 auto}
+
+/* Top bar */
+#topbar{display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--border);flex-shrink:0}
+#topbar h1{font-size:16px;font-weight:600;color:var(--accent)}
+#status{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim)}
+#status-dot{width:8px;height:8px;border-radius:50%;background:var(--danger);transition:background .3s}
+#status-dot.connected{background:var(--success)}
+
+/* Messages area */
+#messages{flex:1;overflow-y:auto;padding:16px;scroll-behavior:smooth}
+.msg{margin-bottom:16px;max-width:85%;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.msg.user{margin-left:auto}
+.msg.ai{margin-right:auto}
+.msg-bubble{padding:10px 14px;border-radius:12px;line-height:1.6;word-wrap:break-word;overflow-wrap:break-word}
+.msg.user .msg-bubble{background:var(--user-bg);border-bottom-right-radius:4px}
+.msg.ai .msg-bubble{background:var(--ai-bg);border-bottom-left-radius:4px}
+
+/* Markdown */
+.msg-bubble code{font-family:var(--font-mono);background:var(--code-bg);padding:2px 5px;border-radius:3px;font-size:13px}
+.msg-bubble pre{background:var(--code-bg);padding:12px;border-radius:6px;overflow-x:auto;margin:8px 0;position:relative}
+.msg-bubble pre code{background:none;padding:0;font-size:13px;line-height:1.5}
+.msg-bubble a{color:var(--accent);text-decoration:none}
+.msg-bubble a:hover{text-decoration:underline}
+.msg-bubble strong{font-weight:600}
+.msg-bubble em{font-style:italic}
+.msg-bubble p{margin:4px 0}
+.msg-bubble ul,.msg-bubble ol{margin:4px 0 4px 20px}
+.msg-bubble blockquote{border-left:3px solid var(--accent);padding-left:10px;margin:6px 0;color:var(--text-dim)}
+.msg-bubble h1,.msg-bubble h2,.msg-bubble h3{margin:8px 0 4px;font-weight:600}
+.msg-bubble h1{font-size:1.3em}
+.msg-bubble h2{font-size:1.15em}
+.msg-bubble h3{font-size:1.05em}
+
+/* Collapsible sections (thinking / tool use) */
+.collapsible{margin:8px 0}
+.collapsible summary{cursor:pointer;color:var(--text-dim);font-size:13px;padding:4px 0;user-select:none}
+.collapsible summary:hover{color:var(--text)}
+.collapsible-body{padding:8px 12px;margin-top:4px;background:var(--surface);border-radius:6px;font-size:13px;color:var(--text-dim);white-space:pre-wrap;font-family:var(--font-mono);max-height:300px;overflow-y:auto}
+
+/* Permission card */
+.perm-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;margin:8px 0}
+.perm-card p{margin-bottom:10px;font-size:14px}
+.perm-buttons{display:flex;gap:8px}
+.perm-btn{padding:6px 18px;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer;transition:opacity .2s}
+.perm-btn:hover{opacity:.85}
+.perm-btn.allow{background:var(--success);color:#1a1a2e}
+.perm-btn.deny{background:var(--danger);color:#fff}
+.perm-btn:disabled{opacity:.4;cursor:not-allowed}
+
+/* Input area */
+#input-area{display:flex;align-items:flex-end;gap:8px;padding:12px 16px;border-top:1px solid var(--border);flex-shrink:0}
+#input{flex:1;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:15px;font-family:var(--font-sans);resize:none;outline:none;min-height:42px;max-height:150px;line-height:1.5;overflow-y:auto}
+#input:focus{border-color:var(--accent)}
+#input::placeholder{color:var(--text-dim)}
+#send-btn{background:var(--accent);color:var(--bg);border:none;border-radius:10px;padding:10px 16px;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .2s;flex-shrink:0;height:42px}
+#send-btn:hover{opacity:.85}
+#send-btn:disabled{opacity:.4;cursor:not-allowed}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <h1>cc-connect</h1>
+    <div id="status">
+      <div id="status-dot"></div>
+      <span id="status-text">Disconnected</span>
+    </div>
+  </div>
+  <div id="messages"></div>
+  <div id="input-area">
+    <textarea id="input" rows="1" placeholder="Type a message..."></textarea>
+    <button id="send-btn">Send</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('send-btn');
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+
+  let ws = null;
+  let reconnectTimer = null;
+  // Track messages by message_id for streaming updates
+  const msgElements = {};
+
+  // --- WebSocket ---
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+    ws.onopen = function() {
+      statusDot.classList.add('connected');
+      statusText.textContent = 'Connected';
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+
+    ws.onclose = function() {
+      statusDot.classList.remove('connected');
+      statusText.textContent = 'Disconnected';
+      ws = null;
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      if (ws) ws.close();
+    };
+
+    ws.onmessage = function(e) {
+      try {
+        const data = JSON.parse(e.data);
+        handleMessage(data);
+      } catch(err) {
+        console.error('ws: parse error', err);
+      }
+    };
+  }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    statusText.textContent = 'Reconnecting...';
+    reconnectTimer = setTimeout(function() {
+      reconnectTimer = null;
+      connect();
+    }, 3000);
+  }
+
+  function send(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  }
+
+  // --- Message handling ---
+  function handleMessage(data) {
+    switch(data.type) {
+      case 'reply':
+        appendAIMessage(data.content, data.message_id);
+        break;
+      case 'update':
+        updateAIMessage(data.message_id, data.content);
+        break;
+      case 'thinking':
+        appendCollapsible('Thinking', data.content);
+        break;
+      case 'tool_use':
+        appendCollapsible('Tool', data.content);
+        break;
+      case 'permission':
+        appendPermission(data.content, data.request_id);
+        break;
+    }
+    scrollToBottom();
+  }
+
+  function appendUserMessage(text) {
+    const div = document.createElement('div');
+    div.className = 'msg user';
+    div.innerHTML = '<div class="msg-bubble">' + escapeHTML(text) + '</div>';
+    messagesEl.appendChild(div);
+    scrollToBottom();
+  }
+
+  function appendAIMessage(content, messageId) {
+    const div = document.createElement('div');
+    div.className = 'msg ai';
+    const bubble = document.createElement('div');
+    bubble.className = 'msg-bubble';
+    bubble.innerHTML = renderMarkdown(content);
+    div.appendChild(bubble);
+    messagesEl.appendChild(div);
+    if (messageId) {
+      msgElements[messageId] = bubble;
+    }
+  }
+
+  function updateAIMessage(messageId, content) {
+    if (!messageId || !msgElements[messageId]) return;
+    msgElements[messageId].innerHTML = renderMarkdown(content);
+  }
+
+  function appendCollapsible(label, content) {
+    const details = document.createElement('details');
+    details.className = 'collapsible';
+    details.innerHTML = '<summary>' + escapeHTML(label) + '</summary>' +
+      '<div class="collapsible-body">' + escapeHTML(content) + '</div>';
+    // Attach to last AI message if exists, otherwise to messages container
+    const lastAI = messagesEl.querySelector('.msg.ai:last-child .msg-bubble');
+    if (lastAI) {
+      lastAI.appendChild(details);
+    } else {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'msg ai';
+      const bubble = document.createElement('div');
+      bubble.className = 'msg-bubble';
+      bubble.appendChild(details);
+      wrapper.appendChild(bubble);
+      messagesEl.appendChild(wrapper);
+    }
+  }
+
+  function appendPermission(content, requestId) {
+    const div = document.createElement('div');
+    div.className = 'msg ai';
+    const card = document.createElement('div');
+    card.className = 'perm-card';
+    card.innerHTML = '<p>' + escapeHTML(content) + '</p>' +
+      '<div class="perm-buttons">' +
+        '<button class="perm-btn allow" data-rid="' + escapeAttr(requestId) + '">Allow</button>' +
+        '<button class="perm-btn deny" data-rid="' + escapeAttr(requestId) + '">Deny</button>' +
+      '</div>';
+    div.appendChild(card);
+    messagesEl.appendChild(div);
+
+    card.querySelectorAll('.perm-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const allow = btn.classList.contains('allow');
+        send({ type: 'permission_response', request_id: requestId, allow: allow });
+        // Disable buttons after click
+        card.querySelectorAll('.perm-btn').forEach(function(b) { b.disabled = true; });
+        btn.style.opacity = '1';
+      });
+    });
+  }
+
+  // --- Markdown rendering ---
+  function renderMarkdown(text) {
+    if (!text) return '';
+    // Escape HTML first
+    let html = escapeHTML(text);
+
+    // Fenced code blocks: ```lang\n...\n```
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
+      return '<pre><code>' + code + '</code></pre>';
+    });
+
+    // Inline code: `code`
+    html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+    // Headers: ### h3, ## h2, # h1
+    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+
+    // Blockquote: > text
+    html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+
+    // Bold: **text**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+    // Italic: *text*
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    // Links: [text](url)
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+    // Unordered list: - item
+    html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
+    // Collapse consecutive <ul> tags
+    html = html.replace(/<\/ul>\s*<ul>/g, '');
+
+    // Line breaks (but not inside pre/code)
+    html = html.replace(/\n/g, '<br>');
+    // Clean up extra <br> around block elements
+    html = html.replace(/<br>\s*(<pre>|<\/pre>|<h[123]>|<\/h[123]>|<ul>|<\/ul>|<blockquote>|<\/blockquote>)/g, '$1');
+    html = html.replace(/(<pre>|<\/pre>|<h[123]>|<\/h[123]>|<ul>|<\/ul>|<blockquote>|<\/blockquote>)\s*<br>/g, '$1');
+
+    return html;
+  }
+
+  function escapeHTML(s) {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  function escapeAttr(s) {
+    return s.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // --- Input handling ---
+  function autoResize() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 150) + 'px';
+  }
+
+  inputEl.addEventListener('input', autoResize);
+
+  inputEl.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      doSend();
+    }
+  });
+
+  sendBtn.addEventListener('click', doSend);
+
+  function doSend() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    appendUserMessage(text);
+    send({ type: 'message', content: text });
+    inputEl.value = '';
+    autoResize();
+    scrollToBottom();
+  }
+
+  function scrollToBottom() {
+    requestAnimationFrame(function() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+
+  // --- Init ---
+  connect();
+})();
+</script>
+</body>
+</html>
