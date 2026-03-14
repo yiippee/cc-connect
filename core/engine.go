@@ -129,9 +129,9 @@ type Engine struct {
 	speech       SpeechCfg
 	tts          *TTSCfg
 	display      DisplayCfg
-	defaultQuiet   bool
-	injectSender   bool
-	startedAt      time.Time
+	defaultQuiet bool
+	injectSender bool
+	startedAt    time.Time
 
 	providerSaveFunc       func(providerName string) error
 	providerAddSaveFunc    func(p ProviderConfig) error
@@ -145,7 +145,8 @@ type Engine struct {
 	displaySaveFunc  func(thinkingMaxLen, toolMaxLen *int) error
 	configReloadFunc func() (*ConfigReloadResult, error)
 
-	cronScheduler *CronScheduler
+	cronScheduler      *CronScheduler
+	heartbeatScheduler *HeartbeatScheduler
 
 	commands *CommandRegistry
 	skills   *SkillRegistry
@@ -352,8 +353,19 @@ func (e *Engine) SetProviderRemoveSaveFunc(fn func(string) error) {
 	e.providerRemoveSaveFunc = fn
 }
 
+// AddPlatform appends a platform to the engine after construction.
+// The platform is started and wired during the next Engine.Start call,
+// or if the engine is already running, it is started immediately.
+func (e *Engine) AddPlatform(p Platform) {
+	e.platforms = append(e.platforms, p)
+}
+
 func (e *Engine) SetCronScheduler(cs *CronScheduler) {
 	e.cronScheduler = cs
+}
+
+func (e *Engine) SetHeartbeatScheduler(hs *HeartbeatScheduler) {
+	e.heartbeatScheduler = hs
 }
 
 func (e *Engine) SetCommandSaveAddFunc(fn func(name, description, prompt, exec, workDir string) error) {
@@ -552,9 +564,17 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	if !silent {
 		desc := job.Description
 		if desc == "" {
-			desc = truncateStr(job.Prompt, 40)
+			if job.IsShellJob() {
+				desc = truncateStr(job.Exec, 40)
+			} else {
+				desc = truncateStr(job.Prompt, 40)
+			}
 		}
 		e.send(targetPlatform, replyCtx, fmt.Sprintf("⏰ %s", desc))
+	}
+
+	if job.IsShellJob() {
+		return e.executeCronShell(targetPlatform, replyCtx, job)
 	}
 
 	msg := &Message{
@@ -563,6 +583,98 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		UserID:     "cron",
 		UserName:   "cron",
 		Content:    job.Prompt,
+		ReplyCtx:   replyCtx,
+	}
+
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	if !session.TryLock() {
+		return fmt.Errorf("session %q is busy", sessionKey)
+	}
+
+	e.processInteractiveMessage(targetPlatform, msg, session)
+	return nil
+}
+
+// executeCronShell runs a shell command for a cron job and sends the output.
+func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error {
+	workDir := job.WorkDir
+	if workDir == "" {
+		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+			workDir = wd.GetWorkDir()
+		}
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+
+	ctx, cancel := context.WithTimeout(e.ctx, cronJobTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", job.Exec)
+	cmd.Dir = workDir
+	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		e.send(p, replyCtx, fmt.Sprintf("⏰ ⚠️ timeout: `%s`", truncateStr(job.Exec, 60)))
+		return fmt.Errorf("shell command timed out")
+	}
+
+	result := strings.TrimSpace(string(output))
+	if err != nil {
+		if result != "" {
+			e.send(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\n\n%s\n\nerror: %v", truncateStr(job.Exec, 60), truncateStr(result, 3000), err))
+		} else {
+			e.send(p, replyCtx, fmt.Sprintf("⏰ ❌ `%s`\nerror: %v", truncateStr(job.Exec, 60), err))
+		}
+		return fmt.Errorf("shell: %w", err)
+	}
+
+	if result == "" {
+		result = "(no output)"
+	}
+	e.send(p, replyCtx, fmt.Sprintf("⏰ ✅ `%s`\n\n%s", truncateStr(job.Exec, 60), truncateStr(result, 3000)))
+	return nil
+}
+
+// ExecuteHeartbeat runs a heartbeat check by injecting a synthetic message
+// into the main session, similar to cron but designed for periodic awareness.
+func (e *Engine) ExecuteHeartbeat(sessionKey, prompt string, silent bool) error {
+	platformName := ""
+	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+		platformName = sessionKey[:idx]
+	}
+
+	var targetPlatform Platform
+	for _, p := range e.platforms {
+		if p.Name() == platformName {
+			targetPlatform = p
+			break
+		}
+	}
+	if targetPlatform == nil {
+		return fmt.Errorf("platform %q not found for session %q", platformName, sessionKey)
+	}
+
+	rc, ok := targetPlatform.(ReplyContextReconstructor)
+	if !ok {
+		return fmt.Errorf("platform %q does not support proactive messaging (heartbeat)", platformName)
+	}
+
+	replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
+	if err != nil {
+		return fmt.Errorf("reconstruct reply context: %w", err)
+	}
+
+	if !silent {
+		e.send(targetPlatform, replyCtx, "💓 heartbeat")
+	}
+
+	msg := &Message{
+		SessionKey: sessionKey,
+		Platform:   platformName,
+		UserID:     "heartbeat",
+		UserName:   "heartbeat",
+		Content:    prompt,
 		ReplyCtx:   replyCtx,
 	}
 
@@ -1139,7 +1251,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		slog.Error("failed to send prompt", "error", err)
 
 		if !state.agentSession.Alive() {
-			e.cleanupInteractiveState(interactiveKey)
+			e.cleanupInteractiveState(interactiveKey, state)
 			e.send(p, msg.ReplyCtx, e.i18n.T(MsgSessionRestarting))
 
 			state = e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, agentOverride)
@@ -1232,7 +1344,25 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 
 	state, ok := e.interactiveStates[sessionKey]
 	if ok && state.agentSession != nil && state.agentSession.Alive() {
-		return state
+		// Verify the running agent session matches the current active session.
+		// After /new or /switch the active session changes, but the old agent
+		// process may still be alive. Reusing it would send messages to the
+		// wrong conversation context.
+		wantID := session.GetAgentSessionID()
+		currentID := state.agentSession.CurrentSessionID()
+		if wantID == "" || currentID == "" || wantID == currentID {
+			return state
+		}
+		// Active session has changed — tear down the stale agent so we can
+		// start a new one that matches the current session below.
+		slog.Info("interactive session mismatch, recycling",
+			"session_key", sessionKey,
+			"want_agent_session", wantID,
+			"have_agent_session", currentID,
+		)
+		go state.agentSession.Close()
+		delete(e.interactiveStates, sessionKey)
+		ok = false // prevent reading stale settings below
 	}
 
 	// Preserve quiet setting from existing state (e.g. set via /quiet before session started)
@@ -1274,8 +1404,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		return state
 	}
 
+	agentSID := session.GetAgentSessionID()
 	startAt := time.Now()
-	agentSession, err := agent.StartSession(e.ctx, session.AgentSessionID)
+	agentSession, err := agent.StartSession(e.ctx, agentSID)
 	startElapsed := time.Since(startAt)
 	if err != nil {
 		slog.Error("failed to start interactive session", "error", err, "elapsed", startElapsed)
@@ -1284,7 +1415,11 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		return state
 	}
 	if startElapsed >= slowAgentStart {
-		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", session.AgentSessionID)
+		slog.Warn("slow agent session start", "elapsed", startElapsed, "agent", agent.Name(), "session_id", agentSID)
+	}
+
+	if newID := agentSession.CurrentSessionID(); newID != "" {
+		session.CompareAndSetAgentSessionID(newID)
 	}
 
 	state = &interactiveState{
@@ -1295,13 +1430,23 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 	e.interactiveStates[sessionKey] = state
 
-	slog.Info("interactive session started", "session_key", sessionKey, "agent_session", session.AgentSessionID, "elapsed", startElapsed)
+	slog.Info("interactive session started", "session_key", sessionKey, "agent_session", session.GetAgentSessionID(), "elapsed", startElapsed)
 	return state
 }
 
-func (e *Engine) cleanupInteractiveState(sessionKey string) {
+// cleanupInteractiveState removes the interactive state for the given session key
+// and closes its agent session. When an expected state is provided, cleanup is
+// skipped if the map entry has been replaced by a different state — this prevents
+// a stale goroutine (still running after /new created a fresh Session object and
+// a new turn started on it) from accidentally destroying the replacement state.
+func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interactiveState) {
 	e.interactiveMu.Lock()
 	state, ok := e.interactiveStates[sessionKey]
+	if len(expected) > 0 && expected[0] != nil && state != expected[0] {
+		// Another turn has already replaced the state — skip cleanup.
+		e.interactiveMu.Unlock()
+		return
+	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
 
@@ -1330,6 +1475,7 @@ const defaultEventIdleTimeout = 2 * time.Hour
 
 func (e *Engine) processInteractiveEvents(state *interactiveState, session *Session, sessionKey string, msgID string, turnStart time.Time) {
 	var textParts []string
+	var segmentStart int // index into textParts: text before this has been sent/displayed
 	toolCount := 0
 	waitStart := time.Now()
 	firstEventLogged := false
@@ -1366,7 +1512,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			replyCtx := state.replyCtx
 			state.mu.Unlock()
 			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
-			e.cleanupInteractiveState(sessionKey)
+			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-e.ctx.Done():
 			return
@@ -1405,7 +1551,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		switch event.Type {
 		case EventThinking:
 			if !quiet && event.Content != "" {
+				// Flush accumulated text segment before thinking display
+				previewActive := sp.canPreview()
+				if len(textParts) > segmentStart {
+					if !previewActive {
+						segment := strings.Join(textParts[segmentStart:], "")
+						if segment != "" {
+							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+								e.send(p, replyCtx, chunk)
+							}
+						}
+					}
+					segmentStart = len(textParts)
+				}
 				sp.freeze()
+				if previewActive {
+					sp.detachPreview() // keep frozen preview visible as permanent message
+				}
 				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgThinking), preview))
 			}
@@ -1413,17 +1575,45 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventToolUse:
 			toolCount++
 			if !quiet {
-				sp.freeze()
-				inputPreview := truncateIf(event.ToolInput, e.display.ToolMaxLen)
-				// Use code block if content is long (>5 lines or >200 chars), otherwise inline code
-				lineCount := strings.Count(inputPreview, "\n") + 1
-				var formattedInput string
-				if lineCount > 5 || utf8.RuneCountInString(inputPreview) > 200 {
-					formattedInput = fmt.Sprintf("```\n%s\n```", inputPreview)
-				} else {
-					formattedInput = fmt.Sprintf("`%s`", inputPreview)
+				// Flush accumulated text segment before tool display
+				previewActive := sp.canPreview()
+				if len(textParts) > segmentStart {
+					if !previewActive {
+						segment := strings.Join(textParts[segmentStart:], "")
+						if segment != "" {
+							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+								e.send(p, replyCtx, chunk)
+							}
+						}
+					}
+					segmentStart = len(textParts)
 				}
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput))
+				sp.freeze()
+				if previewActive {
+					sp.detachPreview() // keep frozen preview visible as permanent message
+				}
+				toolInput := event.ToolInput
+				var formattedInput string
+				if toolInput == "" {
+					formattedInput = ""
+				} else if strings.Contains(toolInput, "```") {
+					// Already contains code blocks (pre-formatted by agent) — use as-is
+					formattedInput = toolInput
+				} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
+					lang := toolCodeLang(event.ToolName, toolInput)
+					formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
+				} else {
+					switch event.ToolName {
+					case "shell", "run_shell_command", "Bash":
+						formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
+					default:
+						formattedInput = fmt.Sprintf("`%s`", toolInput)
+					}
+				}
+				toolMsg := fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput)
+				for _, chunk := range SplitMessageCodeFenceAware(toolMsg, maxPlatformMessageLen) {
+					e.send(p, replyCtx, chunk)
+				}
 			}
 
 		case EventText:
@@ -1434,17 +1624,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 			if event.SessionID != "" {
-				session.mu.Lock()
-				if session.AgentSessionID == "" {
-					session.AgentSessionID = event.SessionID
-					pendingName := session.Name
-					session.mu.Unlock()
+				if session.CompareAndSetAgentSessionID(event.SessionID) {
+					pendingName := session.GetName()
 					if pendingName != "" && pendingName != "session" && pendingName != "default" {
 						e.sessions.SetSessionName(event.SessionID, pendingName)
 					}
 					e.sessions.Save()
-				} else {
-					session.mu.Unlock()
 				}
 			}
 
@@ -1464,8 +1649,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				continue
 			}
 
-			// Stop streaming preview before sending prompt
+			// Flush accumulated text segment before permission prompt
+			previewActive := sp.canPreview()
+			if len(textParts) > segmentStart {
+				if !previewActive {
+					segment := strings.Join(textParts[segmentStart:], "")
+					if segment != "" {
+						for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
+							e.send(p, replyCtx, chunk)
+						}
+					}
+				}
+				segmentStart = len(textParts)
+			}
 			sp.freeze()
+			if previewActive {
+				sp.detachPreview() // keep frozen preview visible as permanent message
+			}
 
 			slog.Info("permission request",
 				"request_id", event.RequestID,
@@ -1513,9 +1713,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventResult:
 			if event.SessionID != "" {
-				session.mu.Lock()
-				session.AgentSessionID = event.SessionID
-				session.mu.Unlock()
+				session.SetAgentSessionID(event.SessionID)
 			}
 
 			fullResponse := event.Content
@@ -1532,7 +1730,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			turnDuration := time.Since(turnStart)
 			slog.Info("turn complete",
 				"session", session.ID,
-				"agent_session", session.AgentSessionID,
+				"agent_session", session.GetAgentSessionID(),
 				"msg_id", msgID,
 				"tools", toolCount,
 				"response_len", len(fullResponse),
@@ -1541,8 +1739,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			replyStart := time.Now()
 
-			// If streaming preview was active, try to finalize in-place
-			if sp.finish(fullResponse) {
+			// When tool calls happened, text was sent in segments; only send remainder.
+			if toolCount > 0 {
+				sp.finish("") // cleanup preview
+				if segmentStart < len(textParts) {
+					unsent := strings.Join(textParts[segmentStart:], "")
+					if unsent != "" {
+						for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
+							if err := p.Send(e.ctx, replyCtx, chunk); err != nil {
+								slog.Error("failed to send reply", "error", err, "msg_id", msgID)
+								return
+							}
+						}
+					}
+				}
+			} else if sp.finish(fullResponse) {
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
 			} else {
 				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "chunks", len(splitMessage(fullResponse, maxPlatformMessageLen)))
@@ -1584,7 +1795,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 channelClosed:
 	// Channel closed - process exited unexpectedly
 	slog.Warn("agent process exited", "session_key", sessionKey)
-	e.cleanupInteractiveState(sessionKey)
+	e.cleanupInteractiveState(sessionKey, state)
 
 	if len(textParts) > 0 {
 		state.mu.Lock()
@@ -1595,7 +1806,17 @@ channelClosed:
 		fullResponse := strings.Join(textParts, "")
 		session.AddHistory("assistant", fullResponse)
 
-		if sp.finish(fullResponse) {
+		if toolCount > 0 {
+			sp.finish("")
+			if segmentStart < len(textParts) {
+				unsent := strings.Join(textParts[segmentStart:], "")
+				if unsent != "" {
+					for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
+						e.send(p, replyCtx, chunk)
+					}
+				}
+			}
+		} else if sp.finish(fullResponse) {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
 			for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
@@ -1632,6 +1853,7 @@ var builtinCommands = []struct {
 	{[]string{"provider"}, "provider"},
 	{[]string{"memory"}, "memory"},
 	{[]string{"cron"}, "cron"},
+	{[]string{"heartbeat", "hb"}, "heartbeat"},
 	{[]string{"compress", "compact"}, "compress"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"help"}, "help"},
@@ -1755,6 +1977,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdMemory(p, msg, args)
 	case "cron":
 		e.cmdCron(p, msg, args)
+	case "heartbeat":
+		e.cmdHeartbeat(p, msg, args)
 	case "compress":
 		e.cmdCompress(p, msg)
 	case "stop":
@@ -1978,7 +2202,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 
 		agentName := agent.Name()
 		activeSession := sessions.GetOrCreateActive(msg.SessionKey)
-		activeAgentID := activeSession.AgentSessionID
+		activeAgentID := activeSession.GetAgentSessionID()
 
 		var sb strings.Builder
 		if totalPages > 1 {
@@ -2060,8 +2284,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	session.AgentSessionID = matched.ID
-	session.Name = matched.Summary
+	session.SetAgentInfo(matched.ID, matched.Summary)
 	session.ClearHistory()
 	sessions.Save()
 
@@ -2182,8 +2405,8 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 		if result == "" {
 			result = "(no output)"
 		}
-		if len(result) > 4000 {
-			result = result[:3997] + "..."
+		if runes := []rune(result); len(runes) > 4000 {
+			result = string(runes[:3997]) + "..."
 		}
 
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("$ %s\n```\n%s\n```", shellCmd, result))
@@ -2313,7 +2536,7 @@ func (e *Engine) cmdName(p Platform, msg *Message, args []string) {
 	} else {
 		// /name <name...> → current session
 		session := sessions.GetOrCreateActive(msg.SessionKey)
-		targetID = session.AgentSessionID
+		targetID = session.GetAgentSessionID()
 		if targetID == "" {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgNameNoSession))
 			return
@@ -2344,7 +2567,7 @@ func (e *Engine) cmdCurrent(p Platform, msg *Message) {
 			return
 		}
 		s := sessions.GetOrCreateActive(msg.SessionKey)
-		agentID := s.AgentSessionID
+		agentID := s.GetAgentSessionID()
 		if agentID == "" {
 			agentID = e.i18n.T(MsgSessionNotStarted)
 		}
@@ -2406,7 +2629,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 		modeStr += e.i18n.Tf(MsgStatusQuiet, quietStr)
 
 		s := sessions.GetOrCreateActive(msg.SessionKey)
-		sessionDisplayName := sessions.GetSessionName(s.AgentSessionID)
+		sessionDisplayName := sessions.GetSessionName(s.GetAgentSessionID())
 		if sessionDisplayName == "" {
 			sessionDisplayName = s.Name
 		}
@@ -2426,6 +2649,8 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 			}
 		}
 
+		sessionKeyStr := e.i18n.Tf(MsgStatusSessionKey, msg.SessionKey)
+
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgStatusTitle,
 			e.name,
 			agent.Name(),
@@ -2435,6 +2660,7 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 			modeStr,
 			sessionStr,
 			cronStr,
+			sessionKeyStr,
 		))
 		return
 	}
@@ -2794,9 +3020,9 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 	modeStr += e.i18n.Tf(MsgStatusQuiet, quietStr)
 
 	s := sessions.GetOrCreateActive(sessionKey)
-	sessionDisplayName := sessions.GetSessionName(s.AgentSessionID)
+	sessionDisplayName := sessions.GetSessionName(s.GetAgentSessionID())
 	if sessionDisplayName == "" {
-		sessionDisplayName = s.Name
+		sessionDisplayName = s.GetName()
 	}
 	sessionStr := e.i18n.Tf(MsgStatusSession, sessionDisplayName, len(s.History))
 
@@ -2814,6 +3040,8 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 		}
 	}
 
+	sessionKeyStr := e.i18n.Tf(MsgStatusSessionKey, sessionKey)
+
 	statusText := e.i18n.Tf(MsgStatusTitle,
 		e.name,
 		agent.Name(),
@@ -2823,6 +3051,7 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 		modeStr,
 		sessionStr,
 		cronStr,
+		sessionKeyStr,
 	)
 	title, body := splitCardTitleBody(statusText)
 
@@ -2903,9 +3132,10 @@ func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
 	}
 
 	entries := s.GetHistory(n)
-	if len(entries) == 0 && s.AgentSessionID != "" {
+	agentSID := s.GetAgentSessionID()
+	if len(entries) == 0 && agentSID != "" {
 		if hp, ok := agent.(HistoryProvider); ok {
-			if agentEntries, err := hp.GetSessionHistory(e.ctx, s.AgentSessionID, n); err == nil {
+			if agentEntries, err := hp.GetSessionHistory(e.ctx, agentSID, n); err == nil {
 				entries = agentEntries
 			}
 		}
@@ -3059,14 +3289,18 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/lang", action: "nav:/lang"},
 				{command: "/provider", action: "nav:/provider"},
 				{command: "/memory", action: "cmd:/memory"},
+				{command: "/allow", action: "cmd:/allow"},
 				{command: "/quiet", action: "act:/quiet"},
+				{command: "/tts", action: "cmd:/tts"},
 			},
 		},
 		{
 			key:      "tools",
 			titleKey: MsgHelpToolsSection,
 			items: []helpCardItem{
+				{command: "/shell", action: "cmd:/shell"},
 				{command: "/cron", action: "nav:/cron"},
+				{command: "/heartbeat", action: "nav:/heartbeat"},
 				{command: "/commands", action: "nav:/commands"},
 				{command: "/alias", action: "nav:/alias"},
 				{command: "/skills", action: "nav:/skills"},
@@ -3082,6 +3316,8 @@ func helpCardGroups() []helpCardGroup {
 				{command: "/doctor", action: "nav:/doctor"},
 				{command: "/usage", action: "cmd:/usage"},
 				{command: "/config", action: "nav:/config"},
+				{command: "/bind", action: "cmd:/bind"},
+				{command: "/workspace", action: "cmd:/workspace"},
 				{command: "/version", action: "nav:/version"},
 				{command: "/upgrade", action: "nav:/upgrade"},
 				{command: "/restart", action: "cmd:/restart"},
@@ -3294,7 +3530,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = ""
+	s.SetAgentSessionID("")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -3375,7 +3611,7 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = ""
+	s.SetAgentSessionID("")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -3635,7 +3871,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, sessionKey strin
 		select {
 		case event, ok = <-events:
 			if !ok {
-				e.cleanupInteractiveState(sessionKey)
+				e.cleanupInteractiveState(sessionKey, state)
 				if len(textParts) > 0 {
 					e.send(p, replyCtx, strings.Join(textParts, ""))
 				} else {
@@ -3645,7 +3881,7 @@ func (e *Engine) processCompressEvents(state *interactiveState, sessionKey strin
 			}
 		case <-idleCh:
 			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
-			e.cleanupInteractiveState(sessionKey)
+			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-e.ctx.Done():
 			return
@@ -4292,6 +4528,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderProviderCard()
 	case "/cron":
 		return e.renderCronCard(sessionKey)
+	case "/heartbeat":
+		return e.renderHeartbeatCard()
 	case "/commands":
 		return e.renderCommandsCard()
 	case "/alias":
@@ -4345,7 +4583,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		switcher.SetModel(target)
 		e.cleanupInteractiveState(sessionKey)
 		s := e.sessions.GetOrCreateActive(sessionKey)
-		s.AgentSessionID = ""
+		s.SetAgentSessionID("")
 		s.ClearHistory()
 		e.sessions.Save()
 
@@ -4367,7 +4605,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 				switcher.SetReasoningEffort(target)
 				e.cleanupInteractiveState(sessionKey)
 				s := e.sessions.GetOrCreateActive(sessionKey)
-				s.AgentSessionID = ""
+				s.SetAgentSessionID("")
 				s.ClearHistory()
 				e.sessions.Save()
 				return
@@ -4463,8 +4701,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		session := sessions.GetOrCreateActive(sessionKey)
-		session.AgentSessionID = matched.ID
-		session.Name = matched.Summary
+		session.SetAgentInfo(matched.ID, matched.Summary)
 		session.ClearHistory()
 		sessions.Save()
 
@@ -4497,6 +4734,19 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if agentSession != nil {
 			slog.Debug("cleanupInteractiveState: closing agent session", "session", sessionKey)
 			go agentSession.Close()
+		}
+
+	case "/heartbeat":
+		if e.heartbeatScheduler == nil {
+			return
+		}
+		switch args {
+		case "pause", "stop":
+			e.heartbeatScheduler.Pause(e.name)
+		case "resume", "start":
+			e.heartbeatScheduler.Resume(e.name)
+		case "run", "trigger":
+			e.heartbeatScheduler.TriggerNow(e.name)
 		}
 	}
 }
@@ -4604,18 +4854,30 @@ func (e *Engine) renderDeleteModeSelectCard(sessionKey string, sessions *Session
 	}
 
 	cb := NewCard().Title(e.i18n.T(MsgDeleteModeTitle), "carmine")
+	activeAgentID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	selectedCount := 0
 	for i := start; i < end; i++ {
 		s := agentSessions[i]
-		marker := "◻"
-		if _, ok := dm.selectedIDs[s.ID]; ok {
-			marker = "☑"
+		isActive := activeAgentID == s.ID
+		isSelected := false
+		if !isActive {
+			_, isSelected = dm.selectedIDs[s.ID]
 		}
-		if active := sessions.GetOrCreateActive(sessionKey).AgentSessionID; active == s.ID {
-			marker += " ▶"
+		marker := "◻"
+		if isActive {
+			marker = "▶"
+		} else if isSelected {
+			marker = "☑"
+			selectedCount++
 		}
 		btnText := e.i18n.T(MsgDeleteModeSelect)
 		btnType := "default"
-		if _, ok := dm.selectedIDs[s.ID]; ok {
+		action := fmt.Sprintf("act:/delete-mode toggle %s", s.ID)
+		if isActive {
+			btnText = e.i18n.T(MsgCardTitleCurrentSession)
+			btnType = "primary"
+			action = fmt.Sprintf("act:/delete-mode noop %s", s.ID)
+		} else if isSelected {
 			btnText = e.i18n.T(MsgDeleteModeSelected)
 			btnType = "primary"
 		}
@@ -4623,10 +4885,10 @@ func (e *Engine) renderDeleteModeSelectCard(sessionKey string, sessions *Session
 			e.i18n.Tf(MsgListItem, marker, i+1, e.deleteSessionDisplayName(sessions, &s), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")),
 			btnText,
 			btnType,
-			fmt.Sprintf("act:/delete-mode toggle %s", s.ID),
+			action,
 		)
 	}
-	cb.Note(e.i18n.Tf(MsgDeleteModeSelectedCount, len(dm.selectedIDs)))
+	cb.TaggedNote("delete-mode-selected-count", e.i18n.Tf(MsgDeleteModeSelectedCount, selectedCount))
 	if dm.hint != "" {
 		cb.Note(dm.hint)
 	}
@@ -4739,9 +5001,32 @@ func (e *Engine) executeDeleteModeAction(sessionKey, args string) {
 		dm.result = strings.Join(lines, "\n")
 		dm.hint = ""
 		dm.phase = "result"
+	case "form-submit":
+		dm.selectedIDs = parseDeleteModeSelectedIDs(fields[1:])
+		if len(dm.selectedIDs) == 0 {
+			dm.phase = "select"
+			dm.hint = e.i18n.T(MsgDeleteModeEmptySelection)
+			return
+		}
+		dm.phase = "confirm"
+		dm.hint = ""
 	case "cancel":
 		state.deleteMode = nil
 	}
+}
+
+func parseDeleteModeSelectedIDs(args []string) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, arg := range args {
+		for _, id := range strings.Split(arg, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			ids[id] = struct{}{}
+		}
+	}
+	return ids
 }
 
 func (e *Engine) submitDeleteModeSelection(sessionKey string, dm *deleteModeState) []string {
@@ -4950,7 +5235,7 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 
 	agentName := agent.Name()
 	activeSession := sessions.GetOrCreateActive(sessionKey)
-	activeAgentID := activeSession.AgentSessionID
+	activeAgentID := activeSession.GetAgentSessionID()
 
 	var titleStr string
 	if totalPages > 1 {
@@ -5015,7 +5300,7 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 func (e *Engine) renderCurrentCard(sessionKey string) *Card {
 	_, sessions := e.sessionContextForKey(sessionKey)
 	s := sessions.GetOrCreateActive(sessionKey)
-	agentID := s.AgentSessionID
+	agentID := s.GetAgentSessionID()
 	if agentID == "" {
 		agentID = e.i18n.T(MsgSessionNotStarted)
 	}
@@ -5032,9 +5317,10 @@ func (e *Engine) renderHistoryCard(sessionKey string) *Card {
 	s := sessions.GetOrCreateActive(sessionKey)
 	entries := s.GetHistory(10)
 
-	if len(entries) == 0 && s.AgentSessionID != "" {
+	agentSID := s.GetAgentSessionID()
+	if len(entries) == 0 && agentSID != "" {
 		if hp, ok := agent.(HistoryProvider); ok {
-			if agentEntries, err := hp.GetSessionHistory(e.ctx, s.AgentSessionID, 10); err == nil {
+			if agentEntries, err := hp.GetSessionHistory(e.ctx, agentSID, 10); err == nil {
 				entries = agentEntries
 			}
 		}
@@ -5129,7 +5415,11 @@ func (e *Engine) renderCronCard(sessionKey string) *Card {
 		}
 		desc := j.Description
 		if desc == "" {
-			desc = truncateStr(j.Prompt, 60)
+			if j.IsShellJob() {
+				desc = "🖥 " + truncateStr(j.Exec, 60)
+			} else {
+				desc = truncateStr(j.Prompt, 60)
+			}
 		}
 		sb.WriteString(fmt.Sprintf("%s %s\n", status, desc))
 		sb.WriteString(e.i18n.Tf(MsgCronIDLabel, j.ID))
@@ -5440,11 +5730,13 @@ func (e *Engine) cmdCron(p Platform, msg *Message, args []string) {
 	}
 
 	sub := matchSubCommand(strings.ToLower(args[0]), []string{
-		"add", "list", "del", "delete", "rm", "remove", "enable", "disable",
+		"add", "addexec", "list", "del", "delete", "rm", "remove", "enable", "disable",
 	})
 	switch sub {
 	case "add":
 		e.cmdCronAdd(p, msg, args[1:])
+	case "addexec":
+		e.cmdCronAddExec(p, msg, args[1:])
 	case "list":
 		e.cmdCronList(p, msg)
 	case "del", "delete", "rm", "remove":
@@ -5486,6 +5778,39 @@ func (e *Engine) cmdCronAdd(p Platform, msg *Message, args []string) {
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronAdded), job.ID, cronExpr, truncateStr(prompt, 60)))
 }
 
+func (e *Engine) cmdCronAddExec(p Platform, msg *Message, args []string) {
+	if !e.isAdmin(msg.UserID) {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgAdminRequired), "/cron addexec"))
+		return
+	}
+
+	// /cron addexec <min> <hour> <day> <month> <weekday> <shell command...>
+	if len(args) < 6 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCronAddExecUsage))
+		return
+	}
+
+	cronExpr := strings.Join(args[:5], " ")
+	shellCmd := strings.Join(args[5:], " ")
+
+	job := &CronJob{
+		ID:         GenerateCronID(),
+		Project:    e.name,
+		SessionKey: msg.SessionKey,
+		CronExpr:   cronExpr,
+		Exec:       shellCmd,
+		Enabled:    true,
+		CreatedAt:  time.Now(),
+	}
+
+	if err := e.cronScheduler.AddJob(job); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("❌ %v", err))
+		return
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronAddedExec), job.ID, cronExpr, truncateStr(shellCmd, 60)))
+}
+
 func (e *Engine) cmdCronList(p Platform, msg *Message) {
 	jobs := e.cronScheduler.Store().ListBySessionKey(msg.SessionKey)
 	if len(jobs) == 0 {
@@ -5511,7 +5836,11 @@ func (e *Engine) cmdCronList(p Platform, msg *Message) {
 		}
 		desc := j.Description
 		if desc == "" {
-			desc = truncateStr(j.Prompt, 60)
+			if j.IsShellJob() {
+				desc = "🖥 " + truncateStr(j.Exec, 60)
+			} else {
+				desc = truncateStr(j.Prompt, 60)
+			}
 		}
 		sb.WriteString(fmt.Sprintf("%s %s\n", status, desc))
 
@@ -5574,6 +5903,205 @@ func (e *Engine) cmdCronToggle(p Platform, msg *Message, args []string, enable b
 	} else {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCronDisabled), id))
 	}
+}
+
+// ──────────────────────────────────────────────────────────────
+// Heartbeat management commands
+// ──────────────────────────────────────────────────────────────
+
+func (e *Engine) cmdHeartbeat(p Platform, msg *Message, args []string) {
+	if e.heartbeatScheduler == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatNotAvailable))
+		return
+	}
+
+	status := e.heartbeatScheduler.Status(e.name)
+	if status == nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatNotAvailable))
+		return
+	}
+
+	sub := "status"
+	if len(args) > 0 {
+		sub = matchSubCommand(strings.ToLower(args[0]), []string{
+			"status", "pause", "stop", "resume", "start", "run", "trigger", "interval",
+		})
+	}
+
+	switch sub {
+	case "status", "":
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderHeartbeatCard())
+			return
+		}
+		e.cmdHeartbeatStatusText(p, msg, status)
+	case "pause", "stop":
+		e.heartbeatScheduler.Pause(e.name)
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderHeartbeatCard())
+		} else {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatPaused))
+		}
+	case "resume", "start":
+		e.heartbeatScheduler.Resume(e.name)
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderHeartbeatCard())
+		} else {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatResumed))
+		}
+	case "run", "trigger":
+		e.heartbeatScheduler.TriggerNow(e.name)
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatTriggered))
+	case "interval":
+		if len(args) < 2 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatUsage))
+			return
+		}
+		mins, err := strconv.Atoi(args[1])
+		if err != nil || mins <= 0 {
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatInvalidMins))
+			return
+		}
+		e.heartbeatScheduler.SetInterval(e.name, mins)
+		if supportsCards(p) {
+			e.replyWithCard(p, msg.ReplyCtx, e.renderHeartbeatCard())
+		} else {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgHeartbeatInterval), mins))
+		}
+	default:
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgHeartbeatUsage))
+	}
+}
+
+func (e *Engine) cmdHeartbeatStatusText(p Platform, msg *Message, st *HeartbeatStatus) {
+	stateStr, yesNo := e.heartbeatLocalizedHelpers()
+
+	lastRunStr := ""
+	if !st.LastRun.IsZero() {
+		lang := e.i18n.CurrentLang()
+		switch lang {
+		case LangChinese, LangTraditionalChinese:
+			lastRunStr = "上次执行: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		case LangJapanese:
+			lastRunStr = "最終実行: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		default:
+			lastRunStr = "Last run: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		}
+		if st.LastError != "" {
+			lastRunStr += "⚠️ " + truncateStr(st.LastError, 80) + "\n"
+		}
+	}
+
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgHeartbeatStatus),
+		stateStr(st.Paused),
+		st.IntervalMins,
+		yesNo(st.OnlyWhenIdle),
+		yesNo(st.Silent),
+		st.RunCount,
+		st.ErrorCount,
+		st.SkippedBusy,
+		lastRunStr,
+	))
+}
+
+func (e *Engine) heartbeatLocalizedHelpers() (stateStr func(paused bool) string, yesNo func(bool) string) {
+	lang := e.i18n.CurrentLang()
+	switch lang {
+	case LangChinese, LangTraditionalChinese:
+		stateStr = func(paused bool) string {
+			if paused {
+				return "⏸ 已暂停"
+			}
+			return "▶️ 运行中"
+		}
+		yesNo = func(b bool) string {
+			if b {
+				return "是"
+			}
+			return "否"
+		}
+	case LangJapanese:
+		stateStr = func(paused bool) string {
+			if paused {
+				return "⏸ 一時停止"
+			}
+			return "▶️ 実行中"
+		}
+		yesNo = func(b bool) string {
+			if b {
+				return "はい"
+			}
+			return "いいえ"
+		}
+	default:
+		stateStr = func(paused bool) string {
+			if paused {
+				return "⏸ paused"
+			}
+			return "▶️ running"
+		}
+		yesNo = func(b bool) string {
+			if b {
+				return "yes"
+			}
+			return "no"
+		}
+	}
+	return
+}
+
+func (e *Engine) renderHeartbeatCard() *Card {
+	if e.heartbeatScheduler == nil {
+		return e.simpleCard(e.i18n.T(MsgCardTitleHeartbeat), "purple", e.i18n.T(MsgHeartbeatNotAvailable))
+	}
+	st := e.heartbeatScheduler.Status(e.name)
+	if st == nil {
+		return e.simpleCard(e.i18n.T(MsgCardTitleHeartbeat), "purple", e.i18n.T(MsgHeartbeatNotAvailable))
+	}
+
+	stateStr, yesNo := e.heartbeatLocalizedHelpers()
+	lang := e.i18n.CurrentLang()
+
+	lastRunStr := ""
+	if !st.LastRun.IsZero() {
+		switch lang {
+		case LangChinese, LangTraditionalChinese:
+			lastRunStr = "上次执行: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		case LangJapanese:
+			lastRunStr = "最終実行: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		default:
+			lastRunStr = "Last run: " + st.LastRun.Format("01-02 15:04:05") + "\n"
+		}
+		if st.LastError != "" {
+			lastRunStr += "⚠️ " + truncateStr(st.LastError, 80) + "\n"
+		}
+	}
+
+	body := fmt.Sprintf(e.i18n.T(MsgHeartbeatStatus),
+		stateStr(st.Paused),
+		st.IntervalMins,
+		yesNo(st.OnlyWhenIdle),
+		yesNo(st.Silent),
+		st.RunCount,
+		st.ErrorCount,
+		st.SkippedBusy,
+		lastRunStr,
+	)
+
+	cb := NewCard().Title(e.i18n.T(MsgCardTitleHeartbeat), "purple").Markdown(body)
+
+	var actionBtns []CardButton
+	if st.Paused {
+		actionBtns = append(actionBtns, PrimaryBtn("▶️ Resume", "act:/heartbeat resume"))
+	} else {
+		actionBtns = append(actionBtns, DefaultBtn("⏸ Pause", "act:/heartbeat pause"))
+	}
+	actionBtns = append(actionBtns, DefaultBtn("💓 Run Now", "act:/heartbeat run"))
+	cb.Buttons(actionBtns...)
+
+	cb.Buttons(e.cardBackButton())
+
+	return cb.Build()
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -6394,7 +6922,7 @@ func (e *Engine) deleteSingleSessionReply(msg *Message, deleter SessionDeleter, 
 	// Prevent deleting the currently active session
 	_, sessions := e.sessionContextForKey(msg.SessionKey)
 	activeSession := sessions.GetOrCreateActive(msg.SessionKey)
-	if activeSession.AgentSessionID == matched.ID {
+	if activeSession.GetAgentSessionID() == matched.ID {
 		return e.i18n.T(MsgDeleteActiveDenied)
 	}
 
@@ -6423,6 +6951,23 @@ func (e *Engine) deleteSessionDisplayName(sessions *SessionManager, matched *Age
 	return displayName
 }
 
+// toolCodeLang picks the code block language hint for tool display.
+func toolCodeLang(toolName, input string) string {
+	switch toolName {
+	case "shell", "run_shell_command", "Bash":
+		return "bash"
+	case "write_file", "WriteFile", "replace", "ReplaceInFile":
+		if strings.Contains(input, "\n- ") || strings.Contains(input, "\n+ ") {
+			return "diff"
+		}
+	}
+	// Fallback: detect diff-like content
+	if strings.Contains(input, "\n- ") && strings.Contains(input, "\n+ ") {
+		return "diff"
+	}
+	return ""
+}
+
 // truncateIf truncates s to maxLen runes. 0 means no truncation.
 func truncateIf(s string, maxLen int) string {
 	if maxLen <= 0 {
@@ -6435,28 +6980,33 @@ func truncateIf(s string, maxLen int) string {
 }
 
 func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
 		return []string{text}
 	}
 	var chunks []string
 
-	for len(text) > 0 {
-		if len(text) <= maxLen {
-			chunks = append(chunks, text)
+	for len(runes) > 0 {
+		if len(runes) <= maxLen {
+			chunks = append(chunks, string(runes))
 			break
 		}
 
 		end := maxLen
 
-		// Try to split at newline boundary
-		if idx := strings.LastIndex(text[:end], "\n"); idx > 0 && idx >= end/2 {
-			end = idx + 1
+		// Try to split at newline boundary within the rune window.
+		// Convert the candidate chunk back to a string for newline search.
+		candidate := string(runes[:end])
+		if idx := strings.LastIndex(candidate, "\n"); idx > 0 {
+			// idx is a byte offset within candidate; convert to rune offset.
+			runeIdx := utf8.RuneCountInString(candidate[:idx])
+			if runeIdx >= end/2 {
+				end = runeIdx + 1
+			}
 		}
 
-		chunk := text[:end]
-		text = text[end:]
-
-		chunks = append(chunks, chunk)
+		chunks = append(chunks, string(runes[:end]))
+		runes = runes[end:]
 	}
 	return chunks
 }
@@ -6512,13 +7062,13 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 		inj.SetSessionEnv(envVars)
 	}
 
-	agentSession, err := e.agent.StartSession(ctx, session.AgentSessionID)
+	agentSession, err := e.agent.StartSession(ctx, session.GetAgentSessionID())
 	if err != nil {
 		return "", fmt.Errorf("start relay session: %w", err)
 	}
+	defer agentSession.Close()
 
-	if session.AgentSessionID == "" {
-		session.AgentSessionID = agentSession.CurrentSessionID()
+	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID()) {
 		e.sessions.Save()
 	}
 
@@ -6536,13 +7086,14 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 			if event.Content != "" {
 				textParts = append(textParts, event.Content)
 			}
-			if event.SessionID != "" && session.AgentSessionID == "" {
-				session.AgentSessionID = event.SessionID
-				e.sessions.Save()
+			if event.SessionID != "" {
+				if session.CompareAndSetAgentSessionID(event.SessionID) {
+					e.sessions.Save()
+				}
 			}
 		case EventResult:
 			if event.SessionID != "" {
-				session.AgentSessionID = event.SessionID
+				session.SetAgentSessionID(event.SessionID)
 				e.sessions.Save()
 			}
 			resp := event.Content

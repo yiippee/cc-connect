@@ -30,12 +30,39 @@ type Config struct {
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`     // per-session rate limiting
 	Quiet            *bool               `toml:"quiet,omitempty"`              // global default for quiet mode; project-level overrides this
 	Cron             CronConfig          `toml:"cron"`
+	Webhook          WebhookConfig       `toml:"webhook"`
+	Bridge           BridgeConfig        `toml:"bridge"`
+	Management       ManagementConfig    `toml:"management"`
 	IdleTimeoutMins  *int                `toml:"idle_timeout_mins,omitempty"`  // max minutes between agent events; 0 = no timeout; default 120
 }
 
 // CronConfig controls cron job behavior.
 type CronConfig struct {
 	Silent *bool `toml:"silent"` // suppress cron start notification; default false
+}
+
+// WebhookConfig controls the external HTTP webhook endpoint.
+type WebhookConfig struct {
+	Enabled *bool  `toml:"enabled"`           // default false
+	Port    int    `toml:"port,omitempty"`     // listen port; default 9111
+	Token   string `toml:"token,omitempty"`    // shared secret for authentication; empty = no auth
+	Path    string `toml:"path,omitempty"`     // URL path prefix; default "/hook"
+}
+
+// BridgeConfig controls the WebSocket bridge for external platform adapters.
+type BridgeConfig struct {
+	Enabled *bool  `toml:"enabled"`        // default false
+	Port    int    `toml:"port,omitempty"`  // listen port; default 9810
+	Token   string `toml:"token,omitempty"` // shared secret for authentication; required
+	Path    string `toml:"path,omitempty"`  // URL path; default "/bridge/ws"
+}
+
+// ManagementConfig controls the HTTP Management API for external tools.
+type ManagementConfig struct {
+	Enabled     *bool    `toml:"enabled"`                  // default false
+	Port        int      `toml:"port,omitempty"`           // listen port; default 9820
+	Token       string   `toml:"token,omitempty"`          // shared secret for authentication; required
+	CORSOrigins []string `toml:"cors_origins,omitempty"`   // allowed CORS origins; empty = no CORS
 }
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
@@ -83,7 +110,7 @@ type SpeechConfig struct {
 // TTSConfig configures text-to-speech output (mirrors SpeechConfig style).
 type TTSConfig struct {
 	Enabled     bool   `toml:"enabled"`
-	Provider    string `toml:"provider"`     // "qwen" | "openai"
+	Provider    string `toml:"provider"`     // "qwen" | "openai" | "minimax"
 	Voice       string `toml:"voice"`        // default voice name
 	TTSMode     string `toml:"tts_mode"`     // "voice_only" (default) | "always"
 	MaxTextLen  int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
@@ -97,6 +124,22 @@ type TTSConfig struct {
 		BaseURL string `toml:"base_url"`
 		Model   string `toml:"model"`
 	} `toml:"qwen"`
+	MiniMax struct {
+		APIKey  string `toml:"api_key"`
+		BaseURL string `toml:"base_url"`
+		Model   string `toml:"model"`
+	} `toml:"minimax"`
+}
+
+// HeartbeatConfig controls periodic heartbeat for a project.
+type HeartbeatConfig struct {
+	Enabled      *bool  `toml:"enabled"`                 // default false
+	IntervalMins *int   `toml:"interval_mins,omitempty"` // minutes between heartbeats; default 30
+	OnlyWhenIdle *bool  `toml:"only_when_idle,omitempty"`// only fire when the session is not busy; default true
+	SessionKey   string `toml:"session_key,omitempty"`   // target session key (e.g. "telegram:123:123"); required
+	Prompt       string `toml:"prompt,omitempty"`        // explicit prompt; if empty, reads HEARTBEAT.md from work_dir
+	Silent       *bool  `toml:"silent,omitempty"`        // suppress heartbeat notification; default true
+	TimeoutMins  *int   `toml:"timeout_mins,omitempty"`  // max execution time; default 30
 }
 
 // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
@@ -106,6 +149,7 @@ type ProjectConfig struct {
 	BaseDir          string           `toml:"base_dir,omitempty"` // parent dir for workspaces
 	Agent            AgentConfig      `toml:"agent"`
 	Platforms        []PlatformConfig `toml:"platforms"`
+	Heartbeat        HeartbeatConfig  `toml:"heartbeat"`
 	Quiet            *bool            `toml:"quiet,omitempty"`              // project-level quiet mode; overrides global setting
 	InjectSender     *bool            `toml:"inject_sender,omitempty"`      // prepend sender identity (platform + user ID) to each message sent to the agent
 	DisabledCommands []string         `toml:"disabled_commands,omitempty"`  // commands to disable for this project (e.g. ["restart", "upgrade"])

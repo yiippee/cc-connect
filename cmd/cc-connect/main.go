@@ -380,6 +380,16 @@ func main() {
 				} else {
 					slog.Warn("tts: qwen provider enabled but api_key is empty")
 				}
+			case "minimax":
+				apiKey := cfg.TTS.MiniMax.APIKey
+				baseURL := cfg.TTS.MiniMax.BaseURL
+				model := cfg.TTS.MiniMax.Model
+				if apiKey != "" {
+					ttsCfg.TTS = core.NewMiniMaxTTS(apiKey, baseURL, model, nil)
+					ttsCfg.Provider = "minimax"
+				} else {
+					slog.Warn("tts: minimax provider enabled but api_key is empty")
+				}
 			default: // "openai" or unspecified
 				apiKey := cfg.TTS.OpenAI.APIKey
 				baseURL := cfg.TTS.OpenAI.BaseURL
@@ -449,6 +459,17 @@ func main() {
 		}
 	}
 
+	// Start heartbeat scheduler
+	heartbeatSched := core.NewHeartbeatScheduler(cfg.DataDir)
+	for i, proj := range cfg.Projects {
+		hbCfg := buildHeartbeatConfig(proj.Heartbeat)
+		if hbCfg.Enabled {
+			workDir, _ := proj.Agent.Options["work_dir"].(string)
+			heartbeatSched.Register(proj.Name, hbCfg, engines[i], workDir)
+		}
+		engines[i].SetHeartbeatScheduler(heartbeatSched)
+	}
+
 	var startErrors []error
 	for _, e := range engines {
 		if err := e.Start(); err != nil {
@@ -466,6 +487,67 @@ func main() {
 		if err := cronSched.Start(); err != nil {
 			slog.Error("cron scheduler start failed", "error", err)
 		}
+	}
+
+	heartbeatSched.Start()
+
+	// Start bridge server if enabled
+	var bridgeSrv *core.BridgeServer
+	if cfg.Bridge.Enabled != nil && *cfg.Bridge.Enabled {
+		port := cfg.Bridge.Port
+		if port <= 0 {
+			port = 9810
+		}
+		path := cfg.Bridge.Path
+		if path == "" {
+			path = "/bridge/ws"
+		}
+		bridgeSrv = core.NewBridgeServer(port, cfg.Bridge.Token, path)
+		for i, e := range engines {
+			bp := bridgeSrv.NewPlatform(cfg.Projects[i].Name)
+			bridgeSrv.RegisterEngine(cfg.Projects[i].Name, e, bp)
+			e.AddPlatform(bp)
+		}
+		bridgeSrv.Start()
+	}
+
+	// Start webhook server if enabled
+	var webhookSrv *core.WebhookServer
+	if cfg.Webhook.Enabled != nil && *cfg.Webhook.Enabled {
+		port := cfg.Webhook.Port
+		if port <= 0 {
+			port = 9111
+		}
+		path := cfg.Webhook.Path
+		if path == "" {
+			path = "/hook"
+		}
+		webhookSrv = core.NewWebhookServer(port, cfg.Webhook.Token, path)
+		for i, e := range engines {
+			webhookSrv.RegisterEngine(cfg.Projects[i].Name, e)
+		}
+		webhookSrv.Start()
+	}
+
+	// Start management API server if enabled
+	var mgmtSrv *core.ManagementServer
+	if cfg.Management.Enabled != nil && *cfg.Management.Enabled {
+		port := cfg.Management.Port
+		if port <= 0 {
+			port = 9820
+		}
+		mgmtSrv = core.NewManagementServer(port, cfg.Management.Token, cfg.Management.CORSOrigins)
+		for i, e := range engines {
+			mgmtSrv.RegisterEngine(cfg.Projects[i].Name, e)
+		}
+		if cronSched != nil {
+			mgmtSrv.SetCronScheduler(cronSched)
+		}
+		mgmtSrv.SetHeartbeatScheduler(heartbeatSched)
+		if bridgeSrv != nil {
+			mgmtSrv.SetBridgeServer(bridgeSrv)
+		}
+		mgmtSrv.Start()
 	}
 
 	// Start internal API server for CLI send
@@ -507,6 +589,16 @@ func main() {
 	}
 
 	slog.Info("shutting down...")
+	if mgmtSrv != nil {
+		mgmtSrv.Stop()
+	}
+	if bridgeSrv != nil {
+		bridgeSrv.Stop()
+	}
+	if webhookSrv != nil {
+		webhookSrv.Stop()
+	}
+	heartbeatSched.Stop()
 	if cronSched != nil {
 		cronSched.Stop()
 	}
@@ -812,4 +904,31 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 
 	slog.Info("config reloaded", "project", projName)
 	return result, nil
+}
+
+func buildHeartbeatConfig(hc config.HeartbeatConfig) core.HeartbeatConfig {
+	cfg := core.HeartbeatConfig{
+		IntervalMins: 30,
+		OnlyWhenIdle: true,
+		Silent:       true,
+		TimeoutMins:  30,
+		SessionKey:   hc.SessionKey,
+		Prompt:       hc.Prompt,
+	}
+	if hc.Enabled != nil {
+		cfg.Enabled = *hc.Enabled
+	}
+	if hc.IntervalMins != nil {
+		cfg.IntervalMins = *hc.IntervalMins
+	}
+	if hc.OnlyWhenIdle != nil {
+		cfg.OnlyWhenIdle = *hc.OnlyWhenIdle
+	}
+	if hc.Silent != nil {
+		cfg.Silent = *hc.Silent
+	}
+	if hc.TimeoutMins != nil {
+		cfg.TimeoutMins = *hc.TimeoutMins
+	}
+	return cfg
 }

@@ -50,6 +50,47 @@ func (s *Session) AddHistory(role, content string) {
 	})
 }
 
+// SetAgentInfo atomically sets the agent session ID and name.
+func (s *Session) SetAgentInfo(agentSessionID, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AgentSessionID = agentSessionID
+	s.Name = name
+}
+
+// GetAgentSessionID atomically reads the agent session ID.
+func (s *Session) GetAgentSessionID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.AgentSessionID
+}
+
+// GetName atomically reads the session name.
+func (s *Session) GetName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Name
+}
+
+// SetAgentSessionID atomically sets the agent session ID.
+func (s *Session) SetAgentSessionID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AgentSessionID = id
+}
+
+// CompareAndSetAgentSessionID sets the agent session ID only if it is currently empty.
+// Returns true if the value was set, false if it was already non-empty.
+func (s *Session) CompareAndSetAgentSessionID(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.AgentSessionID != "" {
+		return false
+	}
+	s.AgentSessionID = id
+	return true
+}
+
 func (s *Session) ClearHistory() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -201,6 +242,47 @@ func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.sessionNames[agentSessionID]
+}
+
+// AllSessions returns all sessions across all user keys.
+func (sm *SessionManager) AllSessions() []*Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	out := make([]*Session, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+// FindByID looks up a session by its internal ID across all users.
+func (sm *SessionManager) FindByID(id string) *Session {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[id]
+}
+
+// DeleteByID removes a session by its internal ID from all tracking structures.
+func (sm *SessionManager) DeleteByID(id string) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if _, ok := sm.sessions[id]; !ok {
+		return false
+	}
+	delete(sm.sessions, id)
+	for userKey, ids := range sm.userSessions {
+		for i, sid := range ids {
+			if sid == id {
+				sm.userSessions[userKey] = append(ids[:i], ids[i+1:]...)
+				break
+			}
+		}
+		if sm.activeSession[userKey] == id {
+			delete(sm.activeSession, userKey)
+		}
+	}
+	sm.saveLocked()
+	return true
 }
 
 // Save persists current state to disk. Safe to call from outside (e.g. after message processing).

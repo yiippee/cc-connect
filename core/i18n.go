@@ -195,10 +195,21 @@ const (
 	MsgTTSSwitched   MsgKey = "tts_switched"
 	MsgTTSUsage      MsgKey = "tts_usage"
 
+	MsgHeartbeatNotAvailable MsgKey = "heartbeat_not_available"
+	MsgHeartbeatStatus       MsgKey = "heartbeat_status"
+	MsgHeartbeatPaused       MsgKey = "heartbeat_paused"
+	MsgHeartbeatResumed      MsgKey = "heartbeat_resumed"
+	MsgHeartbeatInterval     MsgKey = "heartbeat_interval"
+	MsgHeartbeatTriggered    MsgKey = "heartbeat_triggered"
+	MsgHeartbeatUsage        MsgKey = "heartbeat_usage"
+	MsgHeartbeatInvalidMins  MsgKey = "heartbeat_invalid_mins"
+
 	MsgCronNotAvailable MsgKey = "cron_not_available"
 	MsgCronUsage        MsgKey = "cron_usage"
 	MsgCronAddUsage     MsgKey = "cron_add_usage"
 	MsgCronAdded        MsgKey = "cron_added"
+	MsgCronAddedExec    MsgKey = "cron_added_exec"
+	MsgCronAddExecUsage MsgKey = "cron_addexec_usage"
 	MsgCronEmpty        MsgKey = "cron_empty"
 	MsgCronListTitle    MsgKey = "cron_list_title"
 	MsgCronListFooter   MsgKey = "cron_list_footer"
@@ -233,10 +244,11 @@ const (
 	MsgUsageFetchFailed   MsgKey = "usage_fetch_failed"
 
 	// Inline strings previously hardcoded in engine.go
-	MsgStatusMode    MsgKey = "status_mode"
-	MsgStatusSession MsgKey = "status_session"
-	MsgStatusCron    MsgKey = "status_cron"
-	MsgStatusQuiet   MsgKey = "status_quiet"
+	MsgStatusMode       MsgKey = "status_mode"
+	MsgStatusSession    MsgKey = "status_session"
+	MsgStatusCron       MsgKey = "status_cron"
+	MsgStatusQuiet      MsgKey = "status_quiet"
+	MsgStatusSessionKey MsgKey = "status_session_key"
 	MsgQuietOnShort  MsgKey = "quiet_on_short"
 	MsgQuietOffShort MsgKey = "quiet_off_short"
 
@@ -268,6 +280,7 @@ const (
 	MsgCardTitleHistoryLast      MsgKey = "card_title_history_last"
 	MsgCardTitleProvider         MsgKey = "card_title_provider"
 	MsgCardTitleCron             MsgKey = "card_title_cron"
+	MsgCardTitleHeartbeat        MsgKey = "card_title_heartbeat"
 	MsgCardTitleCommands         MsgKey = "card_title_commands"
 	MsgCardTitleAlias            MsgKey = "card_title_alias"
 	MsgCardTitleConfig           MsgKey = "card_title_config"
@@ -683,6 +696,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  View/edit agent memory files\n\n" +
 			"/allow <tool>\n  Pre-allow a tool (next session)\n\n" +
 			"/model [name]\n  View/switch model\n\n" +
+			"/reasoning [level]\n  View/switch reasoning effort\n\n" +
 			"/mode [name]\n  View/switch permission mode\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  View/switch language\n\n" +
 			"/quiet [global]\n  Toggle thinking/tool progress (global = all sessions)\n\n" +
@@ -691,10 +705,13 @@ var messages = map[MsgKey]map[Language]string{
 			"/shell <command>\n  Run a shell command and return the output\n\n" +
 			"/stop\n  Stop current execution\n\n" +
 			"/cron [add|list|del|enable|disable]\n  Manage scheduled tasks\n\n" +
+			"/heartbeat [status|pause|resume|run|interval]\n  Manage heartbeat\n\n" +
 			"/commands [add|del]\n  Manage custom slash commands\n\n" +
 			"/alias [add|del]\n  Manage command aliases (e.g. 帮助 → /help)\n\n" +
 			"/skills\n  List agent skills (from SKILL.md)\n\n" +
 			"/config [get|set|reload] [key] [value]\n  View/update runtime configuration\n\n" +
+			"/bind [project|remove]\n  Manage relay binding in group chats\n\n" +
+			"/workspace [init]\n  Manage workspace\n\n" +
 			"/doctor\n  Run system diagnostics\n\n" +
 			"/usage\n  Show account/model quota usage\n\n" +
 			"/upgrade\n  Check for updates and self-update\n\n" +
@@ -720,6 +737,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  查看/编辑 Agent 记忆文件\n\n" +
 			"/allow <工具名>\n  预授权工具（下次会话生效）\n\n" +
 			"/model [名称]\n  查看/切换模型\n\n" +
+			"/reasoning [级别]\n  查看/切换推理强度\n\n" +
 			"/mode [名称]\n  查看/切换权限模式\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切换语言\n\n" +
 			"/quiet [global]\n  开关思考和工具进度消息（global = 全部会话）\n\n" +
@@ -728,10 +746,13 @@ var messages = map[MsgKey]map[Language]string{
 			"/shell <命令>\n  执行 Shell 命令并返回结果\n\n" +
 			"/stop\n  停止当前执行\n\n" +
 			"/cron [add|list|del|enable|disable]\n  管理定时任务\n\n" +
+			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
 			"/commands [add|del]\n  管理自定义命令\n\n" +
 			"/alias [add|del]\n  管理命令别名（如 帮助 → /help）\n\n" +
 			"/skills\n  列出 Agent Skills（来自 SKILL.md）\n\n" +
 			"/config [get|set|reload] [key] [value]\n  查看/修改运行时配置\n\n" +
+			"/bind [项目名|remove]\n  管理群聊中继绑定\n\n" +
+			"/workspace [init]\n  管理工作区\n\n" +
 			"/doctor\n  运行系统诊断\n\n" +
 			"/usage\n  查看账号/模型限额使用情况\n\n" +
 			"/upgrade\n  检查更新并自动升级\n\n" +
@@ -757,6 +778,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  查看/編輯 Agent 記憶檔案\n\n" +
 			"/allow <工具名>\n  預授權工具（下次會話生效）\n\n" +
 			"/model [名稱]\n  查看/切換模型\n\n" +
+			"/reasoning [級別]\n  查看/切換推理強度\n\n" +
 			"/mode [名稱]\n  查看/切換權限模式\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切換語言\n\n" +
 			"/quiet [global]\n  開關思考和工具進度訊息（global = 全部會話）\n\n" +
@@ -765,10 +787,13 @@ var messages = map[MsgKey]map[Language]string{
 			"/shell <命令>\n  執行 Shell 命令並返回結果\n\n" +
 			"/stop\n  停止當前執行\n\n" +
 			"/cron [add|list|del|enable|disable]\n  管理定時任務\n\n" +
+			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
 			"/commands [add|del]\n  管理自訂命令\n\n" +
 			"/alias [add|del]\n  管理命令別名（如 幫助 → /help）\n\n" +
 			"/skills\n  列出 Agent Skills（來自 SKILL.md）\n\n" +
 			"/config [get|set|reload] [key] [value]\n  查看/修改執行階段配置\n\n" +
+			"/bind [項目名|remove]\n  管理群聊中繼綁定\n\n" +
+			"/workspace [init]\n  管理工作區\n\n" +
 			"/doctor\n  執行系統診斷\n\n" +
 			"/usage\n  查看帳號/模型限額使用情況\n\n" +
 			"/upgrade\n  檢查更新並自動升級\n\n" +
@@ -793,6 +818,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  エージェントメモリの表示/編集\n\n" +
 			"/allow <ツール名>\n  ツールを事前許可（次のセッションで有効）\n\n" +
 			"/model [名前]\n  モデルの表示/切り替え\n\n" +
+			"/reasoning [レベル]\n  推論レベルの表示/切り替え\n\n" +
 			"/mode [名前]\n  権限モードの表示/切り替え\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  言語の表示/切り替え\n\n" +
 			"/quiet [global]\n  思考/ツール進捗メッセージの表示切替（global = 全セッション）\n\n" +
@@ -801,10 +827,13 @@ var messages = map[MsgKey]map[Language]string{
 			"/shell <コマンド>\n  シェルコマンドを実行して結果を返す\n\n" +
 			"/stop\n  現在の実行を停止\n\n" +
 			"/cron [add|list|del|enable|disable]\n  スケジュールタスク管理\n\n" +
+			"/heartbeat [status|pause|resume|run|interval]\n  ハートビート管理\n\n" +
 			"/commands [add|del]\n  カスタムコマンド管理\n\n" +
 			"/alias [add|del]\n  コマンドエイリアス管理（例: ヘルプ → /help）\n\n" +
 			"/skills\n  エージェントスキル一覧（SKILL.md から）\n\n" +
 			"/config [get|set|reload] [key] [value]\n  ランタイム設定の表示/変更\n\n" +
+			"/bind [プロジェクト|remove]\n  グループチャットのリレー管理\n\n" +
+			"/workspace [init]\n  ワークスペース管理\n\n" +
 			"/doctor\n  システム診断を実行\n\n" +
 			"/usage\n  アカウント/モデル使用量を表示\n\n" +
 			"/upgrade\n  アップデートを確認して自動更新\n\n" +
@@ -829,6 +858,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/memory [add|global|global add]\n  Ver/editar archivos de memoria del agente\n\n" +
 			"/allow <herramienta>\n  Pre-autorizar herramienta (próxima sesión)\n\n" +
 			"/model [nombre]\n  Ver/cambiar modelo\n\n" +
+			"/reasoning [nivel]\n  Ver/cambiar nivel de razonamiento\n\n" +
 			"/mode [nombre]\n  Ver/cambiar modo de permisos\n\n" +
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  Ver/cambiar idioma\n\n" +
 			"/quiet [global]\n  Alternar mensajes de progreso (global = todas las sesiones)\n\n" +
@@ -837,10 +867,13 @@ var messages = map[MsgKey]map[Language]string{
 			"/shell <comando>\n  Ejecutar un comando shell y devolver la salida\n\n" +
 			"/stop\n  Detener ejecución actual\n\n" +
 			"/cron [add|list|del|enable|disable]\n  Gestionar tareas programadas\n\n" +
+			"/heartbeat [status|pause|resume|run|interval]\n  Gestionar heartbeat\n\n" +
 			"/commands [add|del]\n  Gestionar comandos personalizados\n\n" +
 			"/alias [add|del]\n  Gestionar alias de comandos (ej. ayuda → /help)\n\n" +
 			"/skills\n  Listar skills del agente (desde SKILL.md)\n\n" +
 			"/config [get|set|reload] [key] [value]\n  Ver/actualizar configuración en tiempo de ejecución\n\n" +
+			"/bind [proyecto|remove]\n  Gestionar retransmisión en chats de grupo\n\n" +
+			"/workspace [init]\n  Gestionar workspace\n\n" +
 			"/doctor\n  Ejecutar diagnósticos del sistema\n\n" +
 			"/usage\n  Mostrar uso de cuota de cuenta/modelo\n\n" +
 			"/upgrade\n  Buscar actualizaciones y auto-actualizar\n\n" +
@@ -1301,6 +1334,102 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "使い方: /tts [always|voice_only]",
 		LangSpanish:            "Uso: /tts [always|voice_only]",
 	},
+	MsgHeartbeatNotAvailable: {
+		LangEnglish:            "Heartbeat is not configured for this project.",
+		LangChinese:            "当前项目未配置心跳。",
+		LangTraditionalChinese: "當前項目未配置心跳。",
+		LangJapanese:           "このプロジェクトにはハートビートが設定されていません。",
+		LangSpanish:            "El heartbeat no está configurado para este proyecto.",
+	},
+	MsgHeartbeatStatus: {
+		LangEnglish: "💓 Heartbeat Status\n\n" +
+			"State: %s\n" +
+			"Interval: %d min\n" +
+			"Only when idle: %s\n" +
+			"Silent: %s\n" +
+			"Runs: %d\n" +
+			"Errors: %d\n" +
+			"Skipped (busy): %d\n" +
+			"%s",
+		LangChinese: "💓 心跳状态\n\n" +
+			"状态: %s\n" +
+			"间隔: %d 分钟\n" +
+			"仅空闲时: %s\n" +
+			"静默: %s\n" +
+			"执行次数: %d\n" +
+			"失败次数: %d\n" +
+			"跳过 (忙碌): %d\n" +
+			"%s",
+		LangTraditionalChinese: "💓 心跳狀態\n\n" +
+			"狀態: %s\n" +
+			"間隔: %d 分鐘\n" +
+			"僅空閒時: %s\n" +
+			"靜默: %s\n" +
+			"執行次數: %d\n" +
+			"失敗次數: %d\n" +
+			"跳過 (忙碌): %d\n" +
+			"%s",
+		LangJapanese: "💓 ハートビート状態\n\n" +
+			"状態: %s\n" +
+			"間隔: %d 分\n" +
+			"アイドル時のみ: %s\n" +
+			"サイレント: %s\n" +
+			"実行回数: %d\n" +
+			"エラー: %d\n" +
+			"スキップ (ビジー): %d\n" +
+			"%s",
+		LangSpanish: "💓 Estado del Heartbeat\n\n" +
+			"Estado: %s\n" +
+			"Intervalo: %d min\n" +
+			"Solo cuando inactivo: %s\n" +
+			"Silencioso: %s\n" +
+			"Ejecuciones: %d\n" +
+			"Errores: %d\n" +
+			"Omitidos (ocupado): %d\n" +
+			"%s",
+	},
+	MsgHeartbeatPaused: {
+		LangEnglish:            "💓 Heartbeat paused.",
+		LangChinese:            "💓 心跳已暂停。",
+		LangTraditionalChinese: "💓 心跳已暫停。",
+		LangJapanese:           "💓 ハートビートを一時停止しました。",
+		LangSpanish:            "💓 Heartbeat pausado.",
+	},
+	MsgHeartbeatResumed: {
+		LangEnglish:            "💓 Heartbeat resumed.",
+		LangChinese:            "💓 心跳已恢复。",
+		LangTraditionalChinese: "💓 心跳已恢復。",
+		LangJapanese:           "💓 ハートビートを再開しました。",
+		LangSpanish:            "💓 Heartbeat reanudado.",
+	},
+	MsgHeartbeatInterval: {
+		LangEnglish:            "💓 Heartbeat interval changed to %d minutes.",
+		LangChinese:            "💓 心跳间隔已调整为 %d 分钟。",
+		LangTraditionalChinese: "💓 心跳間隔已調整為 %d 分鐘。",
+		LangJapanese:           "💓 ハートビート間隔を %d 分に変更しました。",
+		LangSpanish:            "💓 Intervalo del heartbeat cambiado a %d minutos.",
+	},
+	MsgHeartbeatTriggered: {
+		LangEnglish:            "💓 Heartbeat triggered.",
+		LangChinese:            "💓 心跳已触发。",
+		LangTraditionalChinese: "💓 心跳已觸發。",
+		LangJapanese:           "💓 ハートビートをトリガーしました。",
+		LangSpanish:            "💓 Heartbeat activado.",
+	},
+	MsgHeartbeatUsage: {
+		LangEnglish:            "Usage: /heartbeat [status|pause|resume|run|interval <mins>]",
+		LangChinese:            "用法: /heartbeat [status|pause|resume|run|interval <分钟>]",
+		LangTraditionalChinese: "用法: /heartbeat [status|pause|resume|run|interval <分鐘>]",
+		LangJapanese:           "使い方: /heartbeat [status|pause|resume|run|interval <分>]",
+		LangSpanish:            "Uso: /heartbeat [status|pause|resume|run|interval <minutos>]",
+	},
+	MsgHeartbeatInvalidMins: {
+		LangEnglish:            "Invalid interval. Please provide a positive number of minutes.",
+		LangChinese:            "无效的间隔。请输入正整数的分钟数。",
+		LangTraditionalChinese: "無效的間隔。請輸入正整數的分鐘數。",
+		LangJapanese:           "無効な間隔です。正の整数を分で指定してください。",
+		LangSpanish:            "Intervalo inválido. Proporcione un número positivo de minutos.",
+	},
 	MsgCronNotAvailable: {
 		LangEnglish:            "Cron scheduler is not available.",
 		LangChinese:            "定时任务调度器未启用。",
@@ -1328,6 +1457,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "✅ 定時任務已建立\nID: `%s`\n調度: `%s`\n內容: %s",
 		LangJapanese:           "✅ スケジュールタスクを作成しました\nID: `%s`\nスケジュール: `%s`\n内容: %s",
 		LangSpanish:            "✅ Tarea programada creada\nID: `%s`\nProgramación: `%s`\nContenido: %s",
+	},
+	MsgCronAddedExec: {
+		LangEnglish:            "✅ Shell cron job created\nID: `%s`\nSchedule: `%s`\nCommand: `%s`",
+		LangChinese:            "✅ Shell 定时任务已创建\nID: `%s`\n调度: `%s`\n命令: `%s`",
+		LangTraditionalChinese: "✅ Shell 定時任務已建立\nID: `%s`\n調度: `%s`\n命令: `%s`",
+		LangJapanese:           "✅ Shell スケジュールタスクを作成しました\nID: `%s`\nスケジュール: `%s`\nコマンド: `%s`",
+		LangSpanish:            "✅ Tarea shell programada creada\nID: `%s`\nProgramación: `%s`\nComando: `%s`",
+	},
+	MsgCronAddExecUsage: {
+		LangEnglish:            "Usage: /cron addexec <min> <hour> <day> <month> <weekday> <shell command>\nExample: /cron addexec 0 6 * * * df -h",
+		LangChinese:            "用法：/cron addexec <分> <时> <日> <月> <周> <shell 命令>\n示例：/cron addexec 0 6 * * * df -h",
+		LangTraditionalChinese: "用法：/cron addexec <分> <時> <日> <月> <週> <shell 命令>\n範例：/cron addexec 0 6 * * * df -h",
+		LangJapanese:           "使い方: /cron addexec <分> <時> <日> <月> <曜日> <シェルコマンド>\n例: /cron addexec 0 6 * * * df -h",
+		LangSpanish:            "Uso: /cron addexec <min> <hora> <día> <mes> <día_semana> <comando shell>\nEjemplo: /cron addexec 0 6 * * * df -h",
 	},
 	MsgCronEmpty: {
 		LangEnglish:            "No scheduled tasks.",
@@ -1392,35 +1535,35 @@ var messages = map[MsgKey]map[Language]string{
 			"Platforms: %s\n" +
 			"Uptime: %s\n" +
 			"Language: %s\n" +
-			"%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s",
 		LangChinese: "cc-connect 状态\n\n" +
 			"项目: %s\n" +
 			"Agent: %s\n" +
 			"平台: %s\n" +
 			"运行时间: %s\n" +
 			"语言: %s\n" +
-			"%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s",
 		LangTraditionalChinese: "cc-connect 狀態\n\n" +
 			"項目: %s\n" +
 			"Agent: %s\n" +
 			"平台: %s\n" +
 			"運行時間: %s\n" +
 			"語言: %s\n" +
-			"%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s",
 		LangJapanese: "cc-connect ステータス\n\n" +
 			"プロジェクト: %s\n" +
 			"エージェント: %s\n" +
 			"プラットフォーム: %s\n" +
 			"稼働時間: %s\n" +
 			"言語: %s\n" +
-			"%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s",
 		LangSpanish: "Estado de cc-connect\n\n" +
 			"Proyecto: %s\n" +
 			"Agente: %s\n" +
 			"Plataformas: %s\n" +
 			"Tiempo activo: %s\n" +
 			"Idioma: %s\n" +
-			"%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s",
 	},
 	MsgModelCurrent: {
 		LangEnglish:            "Current model: %s",
@@ -1605,6 +1748,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "出力抑制モード: %s\n",
 		LangSpanish:            "Modo silencioso: %s\n",
 	},
+	MsgStatusSessionKey: {
+		LangEnglish:            "Session Key: `%s`\n",
+		LangChinese:            "会话 Key: `%s`\n",
+		LangTraditionalChinese: "會話 Key: `%s`\n",
+		LangJapanese:           "セッションキー: `%s`\n",
+		LangSpanish:            "Clave de sesión: `%s`\n",
+	},
 	MsgQuietOnShort: {
 		LangEnglish:            "ON",
 		LangChinese:            "开启",
@@ -1747,6 +1897,10 @@ var messages = map[MsgKey]map[Language]string{
 	MsgCardTitleCron: {
 		LangEnglish: "Cron", LangChinese: "定时任务", LangTraditionalChinese: "定時任務",
 		LangJapanese: "スケジュールタスク", LangSpanish: "Tareas programadas",
+	},
+	MsgCardTitleHeartbeat: {
+		LangEnglish: "Heartbeat", LangChinese: "心跳", LangTraditionalChinese: "心跳",
+		LangJapanese: "ハートビート", LangSpanish: "Heartbeat",
 	},
 	MsgCardTitleCommands: {
 		LangEnglish: "Commands", LangChinese: "命令", LangTraditionalChinese: "命令",

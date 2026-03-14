@@ -87,6 +87,71 @@ level = "info" # debug, info, warn, error
 #                            # 静默模式：不发送定时任务开始执行的通知消息（默认 false）
 
 # =============================================================================
+# Webhook / 外部 Webhook 端点
+# =============================================================================
+# Exposes an HTTP endpoint for external systems (git hooks, CI/CD, file watchers)
+# to trigger agent prompts or shell commands.
+# 暴露一个 HTTP 端点，供外部系统（git hook、CI/CD、文件监听）触发 agent 或 shell 命令。
+#
+# [webhook]
+# enabled = true
+# port = 9111                  # Listen port (default: 9111) / 监听端口（默认 9111）
+# token = "your-secret-token"  # Shared secret for auth; empty = no auth / 认证密钥；为空则不验证
+# path = "/hook"               # URL path (default: "/hook") / URL 路径（默认 "/hook"）
+#
+# Usage / 使用方式:
+#
+#   # Trigger an agent prompt / 触发 agent 执行
+#   curl -X POST http://localhost:9111/hook \
+#     -H "Authorization: Bearer your-secret-token" \
+#     -H "Content-Type: application/json" \
+#     -d '{"session_key":"telegram:123:123","prompt":"review latest commit","event":"git:commit"}'
+#
+#   # Execute a shell command / 执行 shell 命令
+#   curl -X POST http://localhost:9111/hook \
+#     -H "Authorization: Bearer your-secret-token" \
+#     -H "Content-Type: application/json" \
+#     -d '{"session_key":"telegram:123:123","exec":"git log -3 --oneline","event":"git:push"}'
+#
+#   # Git post-commit hook example (.git/hooks/post-commit):
+#   # #!/bin/sh
+#   # MSG=$(git log -1 --pretty=format:"%s")
+#   # curl -sX POST http://localhost:9111/hook \
+#   #   -H "Authorization: Bearer your-secret-token" \
+#   #   -H "Content-Type: application/json" \
+#   #   -d "{\"session_key\":\"telegram:123:123\",\"event\":\"git:commit\",\"prompt\":\"New commit: $MSG. Review it briefly.\"}"
+
+# =============================================================================
+# Bridge Platform (External Adapters via WebSocket)
+# Bridge 平台（通过 WebSocket 接入外部适配器）
+# =============================================================================
+# Allow external adapters written in any language to connect at runtime.
+# 允许使用任何语言编写的外部适配器在运行时动态接入。
+# See docs/bridge-protocol.md for the full protocol specification.
+# 完整协议规范请参阅 docs/bridge-protocol.md。
+#
+# [bridge]
+# enabled = true
+# port = 9810                         # WebSocket listen port (default: 9810) / 监听端口
+# token = "your-bridge-secret"        # Auth token (required) / 认证密钥（必填）
+# path = "/bridge/ws"                 # URL path (default: "/bridge/ws") / URL 路径
+
+# =============================================================================
+# Management API (External Management Tools)
+# 管理 API（外部管理工具）
+# =============================================================================
+# HTTP REST API for external apps (web dashboards, TUI, GUI, Mac tray apps).
+# 为外部应用（Web 管理面板、TUI、GUI、Mac 托盘应用）提供 HTTP REST API。
+# See docs/management-api.md for the full API specification.
+# 完整 API 规范请参阅 docs/management-api.md。
+#
+# [management]
+# enabled = true
+# port = 9820                           # HTTP listen port (default: 9820) / 监听端口
+# token = "your-mgmt-secret"            # Auth token (required) / 认证密钥（必填）
+# cors_origins = ["http://localhost:3000"]  # Allowed CORS origins / 允许的 CORS 来源
+
+# =============================================================================
 # Speech-to-Text (Voice Messages) / 语音转文字（语音消息）
 # =============================================================================
 # Enable to transcribe voice messages to text before sending to agents.
@@ -131,7 +196,7 @@ level = "info" # debug, info, warn, error
 
 # [tts]
 # enabled  = true
-# provider = "qwen"          # "qwen" | "openai"
+# provider = "qwen"          # "qwen" | "openai" | "minimax"
 # voice    = "Cherry"        # default voice / 默认音色（千问支持：Cherry/Serena/Ethan/Chelsie 等）
 # tts_mode = "voice_only"    # "voice_only" (default) | "always"
 # max_text_len = 0           # max rune count before skipping TTS; 0 = no limit
@@ -151,6 +216,14 @@ level = "info" # debug, info, warn, error
 # api_key  = "sk-xxx"
 # base_url = ""              # optional: custom endpoint / 可选：自定义端点
 # model    = "tts-1"         # "tts-1" | "tts-1-hd"
+#
+# # Alternative: MiniMax TTS (T2A v2 streaming API)
+# # 备选：MiniMax TTS（T2A v2 流式 API）
+# # Docs: https://platform.minimaxi.com/document/T2A%20V2
+# [tts.minimax]
+# api_key  = "your-minimax-api-key"
+# base_url = ""              # optional: default "https://api.minimax.io" / 留空使用默认地址
+# model    = "speech-2.8-hd" # "speech-2.8-hd" | "speech-2.8"
 
 # =============================================================================
 # Daemon Mode / 守护进程模式
@@ -342,6 +415,32 @@ name = "my-backend"
 # 仅在个人单用户部署中使用此配置，确保所有允许的用户均可信任。
 # admin_from = "*"
 
+# Heartbeat — periodic awareness check / 心跳 — 周期性巡检
+# The agent wakes up at a fixed interval to check the environment.
+# Agent 会按固定间隔唤醒，检查环境状态。
+#
+# Unlike cron (precise scheduling, isolated tasks), heartbeat runs in the
+# main session with full context — ideal for status monitoring and continuing
+# unfinished work.
+# 与 cron（精确调度、独立任务）不同，heartbeat 在主会话中运行并共享上下文
+# —— 适合状态监控和继续未完成的工作。
+#
+# [projects.heartbeat]
+# enabled = true
+# interval_mins = 30             # Interval in minutes (default: 30) / 间隔分钟数（默认 30）
+# session_key = "telegram:123:123"  # Target session key (required) / 目标会话 key（必填）
+# only_when_idle = true          # Skip if session is busy (default: true) / 会话忙碌时跳过（默认 true）
+# silent = true                  # Suppress "💓" notification (default: true) / 不发送心跳通知（默认 true）
+# timeout_mins = 30              # Max execution time (default: 30) / 最大执行时间（默认 30 分钟）
+# prompt = "check inbox and tasks"  # Explicit prompt; if empty, reads HEARTBEAT.md from work_dir
+#                                    # 显式提示词；为空时从 work_dir 读取 HEARTBEAT.md
+#
+# HEARTBEAT.md example / HEARTBEAT.md 示例:
+#   On heartbeat:
+#   - check inbox
+#   - check background tasks
+#   - continue unfinished work
+
 [projects.agent]
 type = "claudecode"
 
@@ -410,6 +509,17 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "bypassPermission
 # api_key = "sk-xxx"
 # base_url = "https://api.siliconflow.cn"
 # model = "deepseek-ai/DeepSeek-V3"
+# thinking = "disabled"
+#
+# # MiniMax — OpenAI-compatible provider with 204K context window
+# # MiniMax — 兼容 OpenAI 接口的大模型，支持 204K 超长上下文
+# # Models: MiniMax-M2.5 (flagship), MiniMax-M2.5-highspeed (faster)
+# # Docs: https://platform.minimaxi.com
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
 # thinking = "disabled"
 #
 # # For special setups (Bedrock, Vertex, etc.), use the env map:
@@ -733,6 +843,14 @@ app_secret = "your-feishu-app-secret"
 # api_key = "sk-xxx"
 # base_url = "https://custom-api.com/v1"
 # model = "gpt-4o"
+#
+# # MiniMax — OpenAI-compatible, works natively with Codex
+# # MiniMax — 兼容 OpenAI 接口，可直接用于 Codex
+# [[projects.agent.providers]]
+# name = "minimax"
+# api_key = "your-minimax-api-key"
+# base_url = "https://api.minimax.io/v1"
+# model = "MiniMax-M2.5"
 #
 # [[projects.platforms]]
 # type = "telegram"

@@ -24,11 +24,11 @@ func (a *stubAgent) Stop() error                                                
 type stubAgentSession struct{}
 
 func (s *stubAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error { return nil }
-func (s *stubAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
-func (s *stubAgentSession) Events() <-chan Event                                 { return make(chan Event) }
-func (s *stubAgentSession) CurrentSessionID() string                             { return "stub-session" }
-func (s *stubAgentSession) Alive() bool                                          { return true }
-func (s *stubAgentSession) Close() error                                         { return nil }
+func (s *stubAgentSession) RespondPermission(_ string, _ PermissionResult) error         { return nil }
+func (s *stubAgentSession) Events() <-chan Event                                         { return make(chan Event) }
+func (s *stubAgentSession) CurrentSessionID() string                                     { return "stub-session" }
+func (s *stubAgentSession) Alive() bool                                                  { return true }
+func (s *stubAgentSession) Close() error                                                 { return nil }
 
 type recordingAgentSession struct {
 	stubAgentSession
@@ -908,7 +908,7 @@ func TestCmdCurrent_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 	session.Name = "Focus"
-	session.AgentSessionID = "session-123"
+	session.SetAgentSessionID("session-123")
 	session.History = append(session.History, HistoryEntry{Role: "user", Content: "hello", Timestamp: time.Now()})
 
 	e.cmdCurrent(p, msg)
@@ -1071,7 +1071,7 @@ func TestCmdDelete_NoArgsOnCardPlatformShowsDeleteModeCard(t *testing.T) {
 	}
 }
 
-func TestDeleteMode_ToggleSelectionUpdatesCard(t *testing.T) {
+func TestDeleteMode_ToggleSelectionReturnsUpdatedCard(t *testing.T) {
 	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	agent := &stubDeleteAgent{stubListAgent: stubListAgent{sessions: []AgentSessionInfo{
 		{ID: "session-1", Summary: "One"},
@@ -1083,18 +1083,18 @@ func TestDeleteMode_ToggleSelectionUpdatesCard(t *testing.T) {
 	e.cmdDelete(p, msg, nil)
 	card := e.handleCardNav("act:/delete-mode toggle session-2", msg.SessionKey)
 	if card == nil {
-		t.Fatal("expected delete mode card after toggle")
-	}
-
-	btn, ok := findCardAction(card, "act:/delete-mode toggle session-2")
-	if !ok {
-		t.Fatal("expected toggle action for selected session")
-	}
-	if btn.Type != "primary" {
-		t.Fatalf("selected toggle type = %q, want primary", btn.Type)
+		t.Fatal("expected card update after toggle")
 	}
 	if !strings.Contains(card.RenderText(), "1 selected") {
 		t.Fatalf("card text = %q, want selected count", card.RenderText())
+	}
+
+	confirmCard := e.handleCardNav("act:/delete-mode confirm", msg.SessionKey)
+	if confirmCard == nil {
+		t.Fatal("expected confirmation card")
+	}
+	if !strings.Contains(confirmCard.RenderText(), "Two") {
+		t.Fatalf("confirmation text = %q, want selected session", confirmCard.RenderText())
 	}
 }
 
@@ -1243,7 +1243,7 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 	}}}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
-	e.sessions.GetOrCreateActive(msg.SessionKey).AgentSessionID = "session-1"
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1")
 
 	e.cmdDelete(p, msg, nil)
 	_ = e.handleCardNav("act:/delete-mode toggle session-1", msg.SessionKey)
@@ -1256,6 +1256,70 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 	}
 	if !strings.Contains(resultCard.RenderText(), "Cannot delete the currently active session") {
 		t.Fatalf("result text = %q, want active-session warning", resultCard.RenderText())
+	}
+}
+
+func TestDeleteMode_ActiveSessionMarkedWithArrowAndNotSelectable(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	agent := &stubDeleteAgent{stubListAgent: stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "session-1", Summary: "One"},
+		{ID: "session-2", Summary: "Two"},
+	}}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1")
+
+	e.cmdDelete(p, msg, nil)
+	if len(p.repliedCards) != 1 {
+		t.Fatalf("replied cards = %d, want 1", len(p.repliedCards))
+	}
+	card := p.repliedCards[0]
+	if _, ok := findCardAction(card, "act:/delete-mode toggle session-1"); ok {
+		t.Fatal("active session should not be toggle-selectable")
+	}
+	if _, ok := findCardAction(card, "act:/delete-mode noop session-1"); !ok {
+		t.Fatal("expected noop action for active session")
+	}
+	if got := countCardActionValues(card, "act:/delete-mode toggle "); got != 1 {
+		t.Fatalf("toggle action count = %d, want 1", got)
+	}
+	if !strings.Contains(card.RenderText(), "▶ **1.**") {
+		t.Fatalf("card text = %q, want arrow marker for active session", card.RenderText())
+	}
+}
+
+func TestDeleteMode_FormSubmitShowsConfirmThenDeletes(t *testing.T) {
+	p := &stubCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	agent := &stubDeleteAgent{stubListAgent: stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "session-1", Summary: "One"},
+		{ID: "session-2", Summary: "Two"},
+		{ID: "session-3", Summary: "Three"},
+	}}}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
+
+	e.cmdDelete(p, msg, nil)
+	confirmCard := e.handleCardNav("act:/delete-mode form-submit session-1,session-3", msg.SessionKey)
+	if confirmCard == nil {
+		t.Fatal("expected confirm card after form-submit")
+	}
+	if len(agent.deleted) != 0 {
+		t.Fatalf("deleted = %v, want none before confirm", agent.deleted)
+	}
+	confirmText := confirmCard.RenderText()
+	if !strings.Contains(confirmText, "One") || !strings.Contains(confirmText, "Three") {
+		t.Fatalf("confirm text = %q, want selected sessions", confirmText)
+	}
+
+	resultCard := e.handleCardNav("act:/delete-mode submit", msg.SessionKey)
+	if resultCard == nil {
+		t.Fatal("expected result card after submit")
+	}
+	if got, want := strings.Join(agent.deleted, ","), "session-1,session-3"; got != want {
+		t.Fatalf("deleted = %q, want %q", got, want)
+	}
+	if !strings.Contains(resultCard.RenderText(), "Session deleted: One") {
+		t.Fatalf("result text = %q, want delete result", resultCard.RenderText())
 	}
 }
 
@@ -1378,7 +1442,7 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.AgentSessionID = "existing-session"
+	s.SetAgentSessionID("existing-session")
 	s.AddHistory("user", "hello")
 
 	e.cmdReasoning(p, msg, []string{"3"})
@@ -1386,8 +1450,8 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	if agent.reasoningEffort != "high" {
 		t.Fatalf("reasoning effort = %q, want high", agent.reasoningEffort)
 	}
-	if s.AgentSessionID != "" {
-		t.Fatalf("AgentSessionID = %q, want cleared", s.AgentSessionID)
+	if s.GetAgentSessionID() != "" {
+		t.Fatalf("AgentSessionID = %q, want cleared", s.GetAgentSessionID())
 	}
 	if len(s.History) != 0 {
 		t.Fatalf("history length = %d, want 0", len(s.History))
@@ -1705,7 +1769,7 @@ func TestRenderListCard_MakesEveryVisibleSessionClickable(t *testing.T) {
 	}
 
 	e := NewEngine("test", &stubListAgent{sessions: sessions}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
-	e.sessions.GetOrCreateActive("test:user1").AgentSessionID = sessions[5].ID
+	e.sessions.GetOrCreateActive("test:user1").SetAgentSessionID(sessions[5].ID)
 
 	card, err := e.renderListCard("test:user1", 1)
 	if err != nil {
@@ -2108,4 +2172,406 @@ func TestHandlePendingPermission_AskUserQuestion_SkipsPermFlow(t *testing.T) {
 	if answers["0"] != "allow" {
 		t.Errorf("expected free text 'allow' as answer, got %v", answers["0"])
 	}
+}
+
+// ──────────────────────────────────────────────────────────────
+// Session routing / cleanup CAS tests
+// ──────────────────────────────────────────────────────────────
+
+// controllableAgentSession is an AgentSession stub whose session ID, liveness,
+// and events channel can be controlled by the test.
+type controllableAgentSession struct {
+	sessionID string
+	alive     bool
+	events    chan Event
+	closed    chan struct{} // closed when Close() is called
+}
+
+func newControllableSession(id string) *controllableAgentSession {
+	return &controllableAgentSession{
+		sessionID: id,
+		alive:     true,
+		events:    make(chan Event, 8),
+		closed:    make(chan struct{}),
+	}
+}
+
+func (s *controllableAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+	return nil
+}
+func (s *controllableAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *controllableAgentSession) Events() <-chan Event                                 { return s.events }
+func (s *controllableAgentSession) CurrentSessionID() string                             { return s.sessionID }
+func (s *controllableAgentSession) Alive() bool                                          { return s.alive }
+func (s *controllableAgentSession) Close() error {
+	s.alive = false
+	close(s.events)
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+// controllableAgent lets tests control which session is returned by StartSession.
+type controllableAgent struct {
+	nextSession AgentSession
+}
+
+func (a *controllableAgent) Name() string { return "controllable" }
+func (a *controllableAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	if a.nextSession != nil {
+		return a.nextSession, nil
+	}
+	return newControllableSession("default"), nil
+}
+func (a *controllableAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *controllableAgent) Stop() error { return nil }
+
+// TestCleanupCAS_SkipsWhenStateReplaced verifies that cleanupInteractiveState
+// with an expected state pointer is a no-op when the map entry has been replaced.
+// This is the core of the /new race fix: old goroutine's cleanup must not delete
+// a replacement state created by a new turn.
+func TestCleanupCAS_SkipsWhenStateReplaced(t *testing.T) {
+	e := newTestEngine()
+	key := "test:user1"
+
+	oldState := &interactiveState{agentSession: newControllableSession("old")}
+	newState := &interactiveState{agentSession: newControllableSession("new")}
+
+	// Place the NEW state in the map (simulating: /new already cleaned up and
+	// a new turn created a replacement state).
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = newState
+	e.interactiveMu.Unlock()
+
+	// Old goroutine calls cleanup with the OLD state pointer — should be skipped.
+	e.cleanupInteractiveState(key, oldState)
+
+	e.interactiveMu.Lock()
+	current := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+
+	if current != newState {
+		t.Fatal("CAS cleanup deleted the replacement state — race not prevented")
+	}
+}
+
+// TestCleanupCAS_DeletesWhenStateMatches verifies that cleanup proceeds normally
+// when the expected state matches the current map entry.
+func TestCleanupCAS_DeletesWhenStateMatches(t *testing.T) {
+	e := newTestEngine()
+	key := "test:user1"
+
+	state := &interactiveState{agentSession: newControllableSession("s1")}
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	e.cleanupInteractiveState(key, state)
+
+	e.interactiveMu.Lock()
+	current := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+
+	if current != nil {
+		t.Fatal("expected state to be deleted when expected pointer matches")
+	}
+}
+
+// TestCleanupCAS_UnconditionalWithoutExpected verifies that cleanup without an
+// expected pointer always deletes (backward compat for command handlers).
+func TestCleanupCAS_UnconditionalWithoutExpected(t *testing.T) {
+	e := newTestEngine()
+	key := "test:user1"
+
+	state := &interactiveState{agentSession: newControllableSession("s1")}
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// No expected pointer — unconditional cleanup (used by /new, /switch).
+	e.cleanupInteractiveState(key)
+
+	e.interactiveMu.Lock()
+	current := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+
+	if current != nil {
+		t.Fatal("expected unconditional cleanup to delete state")
+	}
+}
+
+// TestSessionMismatch_RecyclesStaleAgent verifies that getOrCreateInteractiveStateWith
+// detects when the running agent session ID differs from the active Session's
+// AgentSessionID and creates a fresh agent instead of reusing the stale one.
+func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
+	newSess := newControllableSession("new-agent-id")
+	agent := &controllableAgent{nextSession: newSess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	// Seed a live agent session with ID "old-agent-id".
+	oldSess := newControllableSession("old-agent-id")
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		agentSession: oldSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Unlock()
+
+	// The active Session now wants a DIFFERENT agent session ID.
+	session := &Session{AgentSessionID: "new-agent-id"}
+
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+
+	if state.agentSession == oldSess {
+		t.Fatal("expected stale agent session to be replaced")
+	}
+	if state.agentSession != newSess {
+		t.Fatal("expected new agent session from StartSession")
+	}
+
+	// Old session should be closed asynchronously.
+	select {
+	case <-oldSess.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old agent session was not closed after mismatch")
+	}
+}
+
+// TestSessionMismatch_DoesNotLeakQuiet verifies that after a session mismatch,
+// the new state gets defaultQuiet instead of inheriting quiet from the stale state.
+func TestSessionMismatch_DoesNotLeakQuiet(t *testing.T) {
+	agent := &controllableAgent{nextSession: newControllableSession("new-id")}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	// Seed a stale state with quiet=true.
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = &interactiveState{
+		agentSession: newControllableSession("old-id"),
+		platform:     p,
+		replyCtx:     "ctx",
+		quiet:        true,
+	}
+	e.interactiveMu.Unlock()
+
+	// Active session wants "new-id", which mismatches "old-id".
+	session := &Session{AgentSessionID: "new-id"}
+
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+
+	state.mu.Lock()
+	q := state.quiet
+	state.mu.Unlock()
+	if q {
+		t.Fatal("quiet leaked from stale state into replacement — ok=false fix not working")
+	}
+}
+
+// TestSessionMismatch_ReusesWhenIDsMatch verifies that getOrCreateInteractiveStateWith
+// returns the existing state when agent session IDs match (no unnecessary recycling).
+func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
+	agent := &controllableAgent{}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	existingSess := newControllableSession("matching-id")
+	existingState := &interactiveState{
+		agentSession: existingSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = existingState
+	e.interactiveMu.Unlock()
+
+	session := &Session{AgentSessionID: "matching-id"}
+
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	if state != existingState {
+		t.Fatal("expected existing state to be reused when session IDs match")
+	}
+}
+
+// TestSessionIDWriteback_ImmediateAfterStartSession verifies that after
+// StartSession, the agent's CurrentSessionID is immediately written back
+// to the Session's AgentSessionID when it was previously empty.
+func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
+	sess := newControllableSession("agent-uuid-123")
+	agent := &controllableAgent{nextSession: sess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := &Session{AgentSessionID: ""} // empty — no prior binding
+
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+
+	got := session.GetAgentSessionID()
+
+	if got != "agent-uuid-123" {
+		t.Fatalf("AgentSessionID = %q, want %q — immediate writeback not working", got, "agent-uuid-123")
+	}
+}
+
+// TestSessionIDWriteback_DoesNotOverwriteExisting verifies that immediate
+// writeback does not clobber an existing AgentSessionID (e.g. from --resume).
+func TestSessionIDWriteback_DoesNotOverwriteExisting(t *testing.T) {
+	sess := newControllableSession("new-uuid")
+	agent := &controllableAgent{nextSession: sess}
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := &Session{AgentSessionID: "existing-uuid"}
+
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+
+	got := session.GetAgentSessionID()
+
+	if got != "existing-uuid" {
+		t.Fatalf("AgentSessionID = %q, want %q — writeback should not overwrite", got, "existing-uuid")
+	}
+}
+
+// TestStaleGoroutineCleanup_RaceSimulation simulates the full race scenario:
+// old turn still processing → /new creates new Session → new turn starts →
+// old turn exits and calls cleanup. Verifies the new state survives.
+func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	newSess := newControllableSession("new-agent")
+	agent := &controllableAgent{nextSession: newSess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	// Step 1: Old turn created state S1 with old agent.
+	oldSess := newControllableSession("old-agent")
+	oldState := &interactiveState{
+		agentSession: oldSess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = oldState
+	e.interactiveMu.Unlock()
+
+	// Step 2: /new runs — unconditional cleanup deletes S1.
+	e.cleanupInteractiveState(key)
+
+	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
+	sessionB := &Session{AgentSessionID: ""}
+	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, nil)
+
+	// Verify S2 is in the map.
+	e.interactiveMu.Lock()
+	current := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+	if current != newState {
+		t.Fatal("new state not in map")
+	}
+
+	// Step 4: Old goroutine exits and calls cleanup with OLD state pointer.
+	// This simulates processInteractiveEvents channelClosed path.
+	e.cleanupInteractiveState(key, oldState)
+
+	// Verify: new state must survive.
+	e.interactiveMu.Lock()
+	afterCleanup := e.interactiveStates[key]
+	e.interactiveMu.Unlock()
+
+	if afterCleanup != newState {
+		t.Fatal("stale goroutine's cleanup deleted the replacement state — CAS not working")
+	}
+	if newState.agentSession.Alive() != true {
+		t.Fatal("replacement agent session was killed by stale cleanup")
+	}
+}
+
+func TestSplitMessageUTF8Safety(t *testing.T) {
+	t.Run("ASCII short", func(t *testing.T) {
+		result := splitMessage("hello", 10)
+		if len(result) != 1 || result[0] != "hello" {
+			t.Fatalf("expected single chunk 'hello', got %v", result)
+		}
+	})
+
+	t.Run("CJK characters split at rune boundary", func(t *testing.T) {
+		// 10 CJK characters (each 3 bytes in UTF-8), total 30 bytes
+		input := "你好世界测试一二三四"
+		if len([]rune(input)) != 10 {
+			t.Fatalf("expected 10 runes, got %d", len([]rune(input)))
+		}
+		// maxLen=5 runes should split into 2 chunks of 5 runes each
+		chunks := splitMessage(input, 5)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d: %v", len(chunks), chunks)
+		}
+		if chunks[0] != "你好世界测" {
+			t.Errorf("chunk[0] = %q, want %q", chunks[0], "你好世界测")
+		}
+		if chunks[1] != "试一二三四" {
+			t.Errorf("chunk[1] = %q, want %q", chunks[1], "试一二三四")
+		}
+	})
+
+	t.Run("emoji split at rune boundary", func(t *testing.T) {
+		// Emoji: 4 bytes each in UTF-8
+		input := "😀😁😂🤣😄😅"
+		runes := []rune(input)
+		if len(runes) != 6 {
+			t.Fatalf("expected 6 runes, got %d", len(runes))
+		}
+		chunks := splitMessage(input, 3)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d: %v", len(chunks), chunks)
+		}
+		if chunks[0] != "😀😁😂" {
+			t.Errorf("chunk[0] = %q, want %q", chunks[0], "😀😁😂")
+		}
+		if chunks[1] != "🤣😄😅" {
+			t.Errorf("chunk[1] = %q, want %q", chunks[1], "🤣😄😅")
+		}
+	})
+
+	t.Run("prefers newline split", func(t *testing.T) {
+		input := "abcde\nfghij"
+		chunks := splitMessage(input, 8)
+		if len(chunks) != 2 {
+			t.Fatalf("expected 2 chunks, got %d: %v", len(chunks), chunks)
+		}
+		// Should split at newline (rune index 5), which is >= 8/2=4
+		if chunks[0] != "abcde\n" {
+			t.Errorf("chunk[0] = %q, want %q", chunks[0], "abcde\n")
+		}
+		if chunks[1] != "fghij" {
+			t.Errorf("chunk[1] = %q, want %q", chunks[1], "fghij")
+		}
+	})
+
+	t.Run("CJK with newline split", func(t *testing.T) {
+		input := "你好\n世界测试一二三四"
+		chunks := splitMessage(input, 5)
+		if len(chunks) < 2 {
+			t.Fatalf("expected at least 2 chunks, got %d: %v", len(chunks), chunks)
+		}
+		// First chunk should split at the newline
+		if chunks[0] != "你好\n" {
+			t.Errorf("chunk[0] = %q, want %q", chunks[0], "你好\n")
+		}
+	})
 }
