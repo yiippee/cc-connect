@@ -251,6 +251,10 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		eventIdleTimeout:  defaultEventIdleTimeout,
 	}
 
+	if ag != nil {
+		e.sessions.InvalidateForAgent(ag.Name())
+	}
+
 	if cp, ok := ag.(CommandProvider); ok {
 		e.commands.SetAgentDirs(cp.CommandDirs())
 	}
@@ -450,7 +454,7 @@ func (e *Engine) SetDisabledCommands(cmds []string) {
 func (e *Engine) SetAdminFrom(adminFrom string) {
 	e.adminFrom = strings.TrimSpace(adminFrom)
 	if e.adminFrom == "" && !e.disabledCmds["shell"] {
-		slog.Warn("admin_from is not set — privileged commands (/shell, /restart, /upgrade) are blocked. "+
+		slog.Warn("admin_from is not set — privileged commands (/shell, /dir, /restart, /upgrade) are blocked. "+
 			"Set admin_from in config to enable them, or use disabled_commands to hide them.",
 			"project", e.name)
 	}
@@ -459,6 +463,7 @@ func (e *Engine) SetAdminFrom(adminFrom string) {
 // privilegedCommands are commands that require admin_from authorization.
 var privilegedCommands = map[string]bool{
 	"shell":   true,
+	"dir":     true,
 	"restart": true,
 	"upgrade": true,
 }
@@ -527,6 +532,19 @@ func (e *Engine) RemoveCommand(name string) bool {
 
 func (e *Engine) ProjectName() string {
 	return e.name
+}
+
+// ActiveSessionKeys returns the session keys of all active interactive sessions.
+func (e *Engine) ActiveSessionKeys() []string {
+	e.interactiveMu.Lock()
+	defer e.interactiveMu.Unlock()
+	var keys []string
+	for key, state := range e.interactiveStates {
+		if state.platform != nil {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // ExecuteCronJob runs a cron job by injecting a synthetic message into the engine.
@@ -915,6 +933,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	if !session.TryLock() {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
@@ -1427,7 +1446,7 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	if newID := agentSession.CurrentSessionID(); newID != "" {
-		session.CompareAndSetAgentSessionID(newID)
+		session.CompareAndSetAgentSessionID(newID, agent.Name())
 	}
 
 	state = &interactiveState{
@@ -1632,7 +1651,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 			if event.SessionID != "" {
-				if session.CompareAndSetAgentSessionID(event.SessionID) {
+				if session.CompareAndSetAgentSessionID(event.SessionID, e.agent.Name()) {
 					pendingName := session.GetName()
 					if pendingName != "" && pendingName != "session" && pendingName != "default" {
 						e.sessions.SetSessionName(event.SessionID, pendingName)
@@ -1721,7 +1740,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventResult:
 			if event.SessionID != "" {
-				session.SetAgentSessionID(event.SessionID)
+				session.SetAgentSessionID(event.SessionID, e.agent.Name())
 			}
 
 			fullResponse := event.Content
@@ -1877,6 +1896,7 @@ var builtinCommands = []struct {
 	{[]string{"bind"}, "bind"},
 	{[]string{"search", "find"}, "search"},
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
+	{[]string{"dir", "cd", "chdir", "workdir"}, "dir"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"workspace", "ws"}, "workspace"},
 }
@@ -2017,6 +2037,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdSearch(p, msg, args)
 	case "shell":
 		e.cmdShell(p, msg, raw)
+	case "dir":
+		e.cmdDir(p, msg, args)
 	case "tts":
 		e.cmdTTS(p, msg, args)
 	case "workspace":
@@ -2292,7 +2314,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	session.SetAgentInfo(matched.ID, matched.Summary)
+	session.SetAgentInfo(matched.ID, agent.Name(), matched.Summary)
 	session.ClearHistory()
 	sessions.Save()
 
@@ -2419,6 +2441,56 @@ func (e *Engine) cmdShell(p Platform, msg *Message, raw string) {
 
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf("$ %s\n```\n%s\n```", shellCmd, result))
 	}()
+}
+
+func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNotSupported))
+		return
+	}
+
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirCurrent, switcher.GetWorkDir()))
+		return
+	}
+	if len(args) == 1 {
+		switch strings.ToLower(strings.TrimSpace(args[0])) {
+		case "help", "-h", "--help":
+			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirUsage))
+			return
+		}
+	}
+
+	newDir := filepath.Clean(strings.Join(args, " "))
+	if !filepath.IsAbs(newDir) {
+		baseDir := switcher.GetWorkDir()
+		if baseDir == "" {
+			baseDir, _ = os.Getwd()
+		}
+		newDir = filepath.Join(baseDir, newDir)
+	}
+
+	info, err := os.Stat(newDir)
+	if err != nil || !info.IsDir() {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirInvalidPath, newDir))
+		return
+	}
+
+	switcher.SetWorkDir(newDir)
+	e.cleanupInteractiveState(interactiveKey)
+
+	s := sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("", "")
+	s.ClearHistory()
+	sessions.Save()
+
+	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgDirChanged, newDir))
 }
 
 // cmdSearch searches sessions by name or message content.
@@ -3538,7 +3610,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.SetAgentSessionID("")
+	s.SetAgentSessionID("", "")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -3619,7 +3691,7 @@ func (e *Engine) cmdReasoning(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(msg.SessionKey)
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.SetAgentSessionID("")
+	s.SetAgentSessionID("", "")
 	s.ClearHistory()
 	e.sessions.Save()
 
@@ -4406,7 +4478,11 @@ func drainEvents(ch <-chan Event) {
 	drained := 0
 	for {
 		select {
-		case <-ch:
+		case _, ok := <-ch:
+			if !ok {
+				// Channel is closed; stop immediately to avoid an infinite loop.
+				return
+			}
 			drained++
 		default:
 			if drained > 0 {
@@ -4589,9 +4665,10 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			target = models[idx-1].Name
 		}
 		switcher.SetModel(target)
-		e.cleanupInteractiveState(sessionKey)
+		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+		e.cleanupInteractiveState(interactiveKey)
 		s := e.sessions.GetOrCreateActive(sessionKey)
-		s.SetAgentSessionID("")
+		s.SetAgentSessionID("", "")
 		s.ClearHistory()
 		e.sessions.Save()
 
@@ -4611,9 +4688,10 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		for _, effort := range efforts {
 			if effort == target {
 				switcher.SetReasoningEffort(target)
-				e.cleanupInteractiveState(sessionKey)
+				interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+				e.cleanupInteractiveState(interactiveKey)
 				s := e.sessions.GetOrCreateActive(sessionKey)
-				s.SetAgentSessionID("")
+				s.SetAgentSessionID("", "")
 				s.ClearHistory()
 				e.sessions.Save()
 				return
@@ -4629,7 +4707,8 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			return
 		}
 		switcher.SetMode(strings.ToLower(args))
-		e.cleanupInteractiveState(sessionKey)
+		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+		e.cleanupInteractiveState(interactiveKey)
 
 	case "/lang":
 		if args == "" {
@@ -4664,7 +4743,8 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			return
 		}
 		if switcher.SetActiveProvider(args) {
-			e.cleanupInteractiveState(sessionKey)
+			interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+			e.cleanupInteractiveState(interactiveKey)
 			if e.providerSaveFunc != nil {
 				_ = e.providerSaveFunc(args)
 			}
@@ -4680,11 +4760,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		e.executeDeleteModeAction(sessionKey, args)
 
 	case "/quiet":
+		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.interactiveMu.Lock()
-		state, ok := e.interactiveStates[sessionKey]
+		state, ok := e.interactiveStates[interactiveKey]
 		if !ok || state == nil {
 			state = &interactiveState{quiet: true}
-			e.interactiveStates[sessionKey] = state
+			e.interactiveStates[interactiveKey] = state
 			e.interactiveMu.Unlock()
 		} else {
 			e.interactiveMu.Unlock()
@@ -4709,7 +4790,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		session := sessions.GetOrCreateActive(sessionKey)
-		session.SetAgentInfo(matched.ID, matched.Summary)
+		session.SetAgentInfo(matched.ID, agent.Name(), matched.Summary)
 		session.ClearHistory()
 		sessions.Save()
 
@@ -4760,11 +4841,12 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 }
 
 func (e *Engine) getOrCreateDeleteModeState(sessionKey string, p Platform, replyCtx any) *deleteModeState {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	e.interactiveMu.Lock()
-	state, ok := e.interactiveStates[sessionKey]
+	state, ok := e.interactiveStates[interactiveKey]
 	if !ok || state == nil {
 		state = &interactiveState{platform: p, replyCtx: replyCtx}
-		e.interactiveStates[sessionKey] = state
+		e.interactiveStates[interactiveKey] = state
 	} else {
 		state.platform = p
 		state.replyCtx = replyCtx
@@ -4786,8 +4868,9 @@ func (e *Engine) getOrCreateDeleteModeState(sessionKey string, p Platform, reply
 }
 
 func (e *Engine) getDeleteModeState(sessionKey string) *deleteModeState {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	e.interactiveMu.Lock()
-	state := e.interactiveStates[sessionKey]
+	state := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 	if state == nil {
 		return nil
@@ -4811,8 +4894,9 @@ func (e *Engine) getDeleteModeState(sessionKey string) *deleteModeState {
 }
 
 func (e *Engine) clearDeleteModeState(sessionKey string) {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	e.interactiveMu.Lock()
-	state := e.interactiveStates[sessionKey]
+	state := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 	if state == nil {
 		return
@@ -4953,8 +5037,9 @@ func (e *Engine) deleteModeSelectionNames(sessions *SessionManager, dm *deleteMo
 }
 
 func (e *Engine) executeDeleteModeAction(sessionKey, args string) {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 	e.interactiveMu.Lock()
-	state := e.interactiveStates[sessionKey]
+	state := e.interactiveStates[interactiveKey]
 	e.interactiveMu.Unlock()
 	if state == nil {
 		return
@@ -7094,7 +7179,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	}
 	defer agentSession.Close()
 
-	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID()) {
+	if session.CompareAndSetAgentSessionID(agentSession.CurrentSessionID(), e.agent.Name()) {
 		e.sessions.Save()
 	}
 
@@ -7113,13 +7198,13 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 				textParts = append(textParts, event.Content)
 			}
 			if event.SessionID != "" {
-				if session.CompareAndSetAgentSessionID(event.SessionID) {
+				if session.CompareAndSetAgentSessionID(event.SessionID, e.agent.Name()) {
 					e.sessions.Save()
 				}
 			}
 		case EventResult:
 			if event.SessionID != "" {
-				session.SetAgentSessionID(event.SessionID)
+				session.SetAgentSessionID(event.SessionID, e.agent.Name())
 				e.sessions.Save()
 			}
 			resp := event.Content

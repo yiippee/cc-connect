@@ -19,7 +19,6 @@ import (
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/daemon"
-
 	// Agent and platform imports are in separate plugin_*.go files
 	// controlled by build tags. See Makefile for selective compilation.
 )
@@ -55,8 +54,14 @@ func main() {
 		case "relay":
 			runRelay(os.Args[2:])
 			return
+		case "sessions":
+			runSessions(os.Args[2:])
+			return
 		case "daemon":
 			runDaemon(os.Args[2:])
+			return
+		case "feishu":
+			runFeishu(os.Args[2:])
 			return
 		}
 	}
@@ -771,6 +776,10 @@ Commands:
     list             List scheduled tasks
     del              Delete a scheduled task by ID
 
+  sessions           Browse session history
+    list             List all sessions (pipe-friendly)
+    show <id>        Show session messages (-n N for last N)
+
   relay              Cross-project message relay
     send             Send a message to another project and get the response
 
@@ -779,6 +788,11 @@ Commands:
     list             List providers (--project)
     remove           Remove a provider (--project, --name)
     import           Import providers from cc-switch
+
+  feishu             Setup Feishu/Lark bot credentials
+    setup            Smart setup (QR create or bind when --app is provided)
+    new              Force QR onboarding to create a new bot
+    bind             Bind existing app_id/app_secret
 
   update             Check for updates and upgrade the binary (--pre for beta)
   check-update       Check if a newer version is available
@@ -791,6 +805,7 @@ Examples:
   cc-connect daemon logs -f           Follow daemon logs
   cc-connect send -m "hello"          Send a message to the active session
   cc-connect cron list                List all scheduled tasks
+  cc-connect feishu setup             Setup Feishu/Lark bot credentials
   cc-connect update                   Update to the latest version
   cc-connect config-example           Print full config.toml example
   cc-connect config-example > c.toml  Save example config to a file

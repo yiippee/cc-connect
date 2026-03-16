@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -47,19 +48,32 @@ func (s *recordingAgentSession) RespondPermission(id string, res PermissionResul
 type stubPlatformEngine struct {
 	n    string
 	sent []string
+	mu   sync.Mutex
 }
 
 func (p *stubPlatformEngine) Name() string               { return p.n }
 func (p *stubPlatformEngine) Start(MessageHandler) error { return nil }
 func (p *stubPlatformEngine) Reply(_ context.Context, _ any, content string) error {
+	p.mu.Lock()
 	p.sent = append(p.sent, content)
+	p.mu.Unlock()
 	return nil
 }
 func (p *stubPlatformEngine) Send(_ context.Context, _ any, content string) error {
+	p.mu.Lock()
 	p.sent = append(p.sent, content)
+	p.mu.Unlock()
 	return nil
 }
 func (p *stubPlatformEngine) Stop() error { return nil }
+
+func (p *stubPlatformEngine) getSent() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := make([]string, len(p.sent))
+	copy(cp, p.sent)
+	return cp
+}
 
 type stubInlineButtonPlatform struct {
 	stubPlatformEngine
@@ -146,6 +160,19 @@ func (a *stubModelModeAgent) GetReasoningEffort() string {
 
 func (a *stubModelModeAgent) AvailableReasoningEfforts() []string {
 	return []string{"low", "medium", "high", "xhigh"}
+}
+
+type stubWorkDirAgent struct {
+	stubAgent
+	workDir string
+}
+
+func (a *stubWorkDirAgent) SetWorkDir(dir string) {
+	a.workDir = dir
+}
+
+func (a *stubWorkDirAgent) GetWorkDir() string {
+	return a.workDir
 }
 
 type stubListAgent struct {
@@ -477,9 +504,10 @@ func TestEngine_AdminFrom_AdminCanRunShell(t *testing.T) {
 	msg := &Message{SessionKey: "test:a1", UserID: "admin1", ReplyCtx: "ctx"}
 	e.handleCommand(p, msg, "/shell echo hello")
 
-	// Shell runs async in a goroutine, so the command should be accepted (not blocked).
-	// No "admin" error should be in replies.
-	for _, s := range p.sent {
+	// Shell runs async in a goroutine; wait for it to complete.
+	time.Sleep(500 * time.Millisecond)
+
+	for _, s := range p.getSent() {
 		if strings.Contains(s, "admin") {
 			t.Errorf("admin user should not be blocked, got: %s", s)
 		}
@@ -908,7 +936,7 @@ func TestCmdCurrent_UsesLegacyTextOnPlatformWithoutCardSupport(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 	session := e.sessions.GetOrCreateActive(msg.SessionKey)
 	session.Name = "Focus"
-	session.SetAgentSessionID("session-123")
+	session.SetAgentSessionID("session-123", "test")
 	session.History = append(session.History, HistoryEntry{Role: "user", Content: "hello", Timestamp: time.Now()})
 
 	e.cmdCurrent(p, msg)
@@ -1243,7 +1271,7 @@ func TestDeleteMode_SubmitBlocksActiveSession(t *testing.T) {
 	}}}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
-	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1")
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1", "test")
 
 	e.cmdDelete(p, msg, nil)
 	_ = e.handleCardNav("act:/delete-mode toggle session-1", msg.SessionKey)
@@ -1267,7 +1295,7 @@ func TestDeleteMode_ActiveSessionMarkedWithArrowAndNotSelectable(t *testing.T) {
 	}}}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
 	msg := &Message{SessionKey: "feishu:user1", ReplyCtx: "ctx"}
-	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1")
+	e.sessions.GetOrCreateActive(msg.SessionKey).SetAgentSessionID("session-1", "test")
 
 	e.cmdDelete(p, msg, nil)
 	if len(p.repliedCards) != 1 {
@@ -1417,6 +1445,123 @@ func TestCmdModel_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	}
 }
 
+func TestCmdDir_ShowsCurrentDirectory(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubWorkDirAgent{workDir: "/tmp/project-a"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdDir(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, nil)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "/tmp/project-a") {
+		t.Fatalf("sent = %q, want current work dir", p.sent[0])
+	}
+}
+
+func TestCmdDir_SwitchesDirectoryAndResetsSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	tempDir := t.TempDir()
+	nextDir := filepath.Join(tempDir, "next")
+	if err := os.Mkdir(nextDir, 0o755); err != nil {
+		t.Fatalf("mkdir next dir: %v", err)
+	}
+
+	agent := &stubWorkDirAgent{workDir: tempDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("existing-session", "test")
+	s.AddHistory("user", "hello")
+
+	e.cmdDir(p, msg, []string{"next"})
+
+	if agent.workDir != nextDir {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, nextDir)
+	}
+	if s.GetAgentSessionID() != "" {
+		t.Fatalf("AgentSessionID = %q, want cleared", s.GetAgentSessionID())
+	}
+	if len(s.History) != 0 {
+		t.Fatalf("history length = %d, want 0", len(s.History))
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], nextDir) {
+		t.Fatalf("sent = %v, want directory changed message", p.sent)
+	}
+}
+
+func TestCmdDir_RejectsMissingDirectory(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	tempDir := t.TempDir()
+	missingDir := filepath.Join(tempDir, "missing")
+	agent := &stubWorkDirAgent{workDir: tempDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdDir(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, []string{"missing"})
+
+	if agent.workDir != tempDir {
+		t.Fatalf("workDir = %q, want unchanged %q", agent.workDir, tempDir)
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], missingDir) {
+		t.Fatalf("sent = %v, want invalid path message", p.sent)
+	}
+}
+
+func TestCmdDir_AliasCdStillWorks(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	tempDir := t.TempDir()
+	nextDir := filepath.Join(tempDir, "next")
+	if err := os.Mkdir(nextDir, 0o755); err != nil {
+		t.Fatalf("mkdir next dir: %v", err)
+	}
+	agent := &stubWorkDirAgent{workDir: tempDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetAdminFrom("admin1")
+
+	e.handleCommand(p, &Message{SessionKey: "test:user1", UserID: "admin1", ReplyCtx: "ctx"}, "/cd next")
+
+	if agent.workDir != nextDir {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, nextDir)
+	}
+}
+
+func TestCmdDir_HelpShowsUsage(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubWorkDirAgent{workDir: "/tmp/project-a"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	e.cmdDir(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, []string{"help"})
+
+	if len(p.sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "/dir <path>") {
+		t.Fatalf("sent = %q, want /dir usage", p.sent[0])
+	}
+}
+
+func TestEngine_AdminFrom_GatesDir(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	tempDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: tempDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:u1", UserID: "user1", ReplyCtx: "ctx"}
+	e.handleCommand(p, msg, "/dir .")
+
+	if len(p.sent) != 1 {
+		t.Fatalf("expected 1 reply, got %d", len(p.sent))
+	}
+	if !strings.Contains(strings.ToLower(p.sent[0]), "admin") {
+		t.Fatalf("expected admin required message, got: %s", p.sent[0])
+	}
+	if agent.workDir != tempDir {
+		t.Fatalf("workDir = %q, want unchanged %q", agent.workDir, tempDir)
+	}
+}
+
 func TestCmdReasoning_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "inline-only"}}
 	agent := &stubModelModeAgent{}
@@ -1442,7 +1587,7 @@ func TestCmdReasoning_SwitchesEffortAndResetsSession(t *testing.T) {
 	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
 
 	s := e.sessions.GetOrCreateActive(msg.SessionKey)
-	s.SetAgentSessionID("existing-session")
+	s.SetAgentSessionID("existing-session", "test")
 	s.AddHistory("user", "hello")
 
 	e.cmdReasoning(p, msg, []string{"3"})
@@ -1769,7 +1914,7 @@ func TestRenderListCard_MakesEveryVisibleSessionClickable(t *testing.T) {
 	}
 
 	e := NewEngine("test", &stubListAgent{sessions: sessions}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
-	e.sessions.GetOrCreateActive("test:user1").SetAgentSessionID(sessions[5].ID)
+	e.sessions.GetOrCreateActive("test:user1").SetAgentSessionID(sessions[5].ID, "test")
 
 	card, err := e.renderListCard("test:user1", 1)
 	if err != nil {
@@ -2724,5 +2869,115 @@ func TestCmdBindSetup_UsesSharedLogic(t *testing.T) {
 	content, _ := os.ReadFile(memFile)
 	if !strings.Contains(string(content), ccConnectInstructionMarker) {
 		t.Error("expected instructions written to file")
+	}
+}
+
+func TestDrainEventsClosedChannel(t *testing.T) {
+	ch := make(chan Event, 2)
+	ch <- Event{Type: EventToolUse, Content: "a"}
+	ch <- Event{Type: EventToolUse, Content: "b"}
+	close(ch)
+
+	done := make(chan struct{})
+	go func() {
+		drainEvents(ch)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok — returned promptly
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainEvents did not return on closed channel (infinite loop)")
+	}
+}
+
+func TestDrainEventsOpenChannel(t *testing.T) {
+	ch := make(chan Event, 3)
+	ch <- Event{Type: EventToolUse, Content: "a"}
+	ch <- Event{Type: EventToolUse, Content: "b"}
+
+	done := make(chan struct{})
+	go func() {
+		drainEvents(ch)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainEvents did not return on open channel with buffered events")
+	}
+
+	// Channel should now be empty.
+	select {
+	case <-ch:
+		t.Fatal("expected channel to be drained")
+	default:
+	}
+}
+
+// ── executeCardAction interactiveKey tests ───────────────────
+
+func TestExecuteCardAction_QuietUsesInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.executeCardAction("/quiet", "", sessionKey)
+
+	e.interactiveMu.Lock()
+	_, ok := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if !ok {
+		t.Error("expected interactive state to be stored under sessionKey (non-multi-workspace)")
+	}
+}
+
+func TestExecuteCardAction_ModelCleansUpWithInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{model: "old"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = &interactiveState{}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/model", "new-model", sessionKey)
+
+	if agent.model != "new-model" {
+		t.Errorf("model = %q, want new-model", agent.model)
+	}
+
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if exists {
+		t.Error("expected interactive state to be cleaned up after /model")
+	}
+}
+
+func TestExecuteCardAction_ModeCleansUpWithInteractiveKey(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubModelModeAgent{mode: "default"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "feishu:channel1:user1"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[sessionKey] = &interactiveState{}
+	e.interactiveMu.Unlock()
+
+	e.executeCardAction("/mode", "yolo", sessionKey)
+
+	e.interactiveMu.Lock()
+	_, exists := e.interactiveStates[sessionKey]
+	e.interactiveMu.Unlock()
+	if exists {
+		t.Error("expected interactive state to be cleaned up after /mode")
 	}
 }
