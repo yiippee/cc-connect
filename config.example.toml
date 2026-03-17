@@ -415,6 +415,29 @@ name = "my-backend"
 # 仅在个人单用户部署中使用此配置，确保所有允许的用户均可信任。
 # admin_from = "*"
 
+# Multi-user mode — per-user rate limits and role-based command ACL
+# 多用户模式 — 按用户速率限制和基于角色的命令权限控制
+#
+# When [projects.users] is configured, each user is matched to a role.
+# Roles control which commands are available and the rate limit for that user.
+# If not configured, behavior is unchanged (backward compatible).
+#
+# 配置 [projects.users] 后，每个用户会被分配到一个角色。
+# 角色控制该用户可用的命令和速率限制。未配置时行为不变（向后兼容）。
+#
+# [projects.users]
+# default_role = "member"
+#
+# [projects.users.roles.admin]
+# user_ids = ["platform_user_id_1", "platform_user_id_2"]
+# disabled_commands = []                                     # no restrictions
+# rate_limit = { max_messages = 50, window_secs = 60 }
+#
+# [projects.users.roles.member]
+# user_ids = ["*"]                                           # matches all unassigned users
+# disabled_commands = ["*"]                                  # disable all built-in commands
+# rate_limit = { max_messages = 10, window_secs = 60 }
+
 # Heartbeat — periodic awareness check / 心跳 — 周期性巡检
 # The agent wakes up at a fixed interval to check the environment.
 # Agent 会按固定间隔唤醒，检查环境状态。
@@ -560,6 +583,29 @@ app_secret = "your-feishu-app-secret"
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话（一个 thread/root 对应一个 Agent 会话）
 # reply_in_thread = false  # If true, all responses are threaded to the original message (helps trace which question triggered which reply)
 #                          # 设为 true 时，所有回复都会引用原消息（方便追踪每条回复对应哪条提问）
+
+# Lark (International Version) / Lark 国际版
+# Lark uses Webhook mode instead of WebSocket long-connection.
+# Lark 使用 Webhook 模式而非 WebSocket 长连接。
+# 1. Create an app at https://open.larksuite.com / 在 https://open.larksuite.com 创建应用
+# 2. Enable Bot capability / 开启机器人能力
+# 3. Add im.message.receive_v1 event, configure Webhook URL (requires public IP)
+#    添加 im.message.receive_v1 事件，配置 Webhook URL（需要公网 IP）
+# 4. Fill in app_id, app_secret, port, callback_path below
+#    填入下方 app_id、app_secret、port、callback_path
+
+# [[projects.platforms]]
+# type = "lark"
+#
+# [projects.platforms.options]
+# app_id = "your-lark-app-id"
+# app_secret = "your-lark-app-secret"
+# port = "8080"                  # Webhook server port / Webhook 服务器端口
+# callback_path = "/feishu/webhook"  # Webhook callback path / Webhook 回调路径
+# encrypt_key = ""               # Event encrypt key (optional) / 事件加密密钥（可选）
+# enable_feishu_card = true
+# allow_from = "*"
+# reaction_emoji = "OnIt"
 
 # DingTalk / 钉钉 (uncomment to enable / 取消注释以启用)
 # 1. Create an app at https://open-dev.dingtalk.com / 在钉钉开放平台创建应用
