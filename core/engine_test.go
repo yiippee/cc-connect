@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -73,6 +74,22 @@ func (p *stubPlatformEngine) getSent() []string {
 	cp := make([]string, len(p.sent))
 	copy(cp, p.sent)
 	return cp
+}
+
+type stubMediaPlatform struct {
+	stubPlatformEngine
+	images []ImageAttachment
+	files  []FileAttachment
+}
+
+func (p *stubMediaPlatform) SendImage(_ context.Context, _ any, img ImageAttachment) error {
+	p.images = append(p.images, img)
+	return nil
+}
+
+func (p *stubMediaPlatform) SendFile(_ context.Context, _ any, file FileAttachment) error {
+	p.files = append(p.files, file)
+	return nil
 }
 
 type stubInlineButtonPlatform struct {
@@ -247,6 +264,159 @@ func (a *stubUsageAgent) GetUsage(_ context.Context) (*UsageReport, error) {
 
 func newTestEngine() *Engine {
 	return NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
+}
+
+func TestEngineSendToSessionWithAttachments(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx-1",
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"delivery ready",
+		[]ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}},
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "report.txt"}},
+	)
+	if err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	if got := p.getSent(); len(got) != 1 || got[0] != "delivery ready" {
+		t.Fatalf("sent text = %#v, want one message", got)
+	}
+	if len(p.images) != 1 || p.images[0].FileName != "chart.png" {
+		t.Fatalf("images = %#v", p.images)
+	}
+	if len(p.files) != 1 || p.files[0].FileName != "report.txt" {
+		t.Fatalf("files = %#v", p.files)
+	}
+}
+
+func TestEngineSendToSessionWithAttachments_UnsupportedPlatform(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx-1",
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"delivery ready",
+		[]ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "chart.png"}},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("expected unsupported attachment send to fail")
+	}
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no sends on failure", got)
+	}
+}
+
+func TestEngineSendToSessionWithAttachments_DisabledByConfig(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetAttachmentSendEnabled(false)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform: p,
+		replyCtx: "ctx-1",
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"delivery ready",
+		nil,
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "report.txt"}},
+	)
+	if err == nil {
+		t.Fatal("expected attachment send to be blocked")
+	}
+	if !errors.Is(err, ErrAttachmentSendDisabled) {
+		t.Fatalf("err = %v, want ErrAttachmentSendDisabled", err)
+	}
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no sends when disabled", got)
+	}
+	if len(p.files) != 0 {
+		t.Fatalf("files = %#v, want no files sent when disabled", p.files)
+	}
+}
+
+func TestProcessInteractiveEvents_SuppressesDuplicateSideChannelText(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	sideText := "已发送 AGENTS.md 文件给你。"
+	if err := e.SendToSessionWithAttachments(sessionKey, sideText, nil, []FileAttachment{{
+		MimeType: "text/markdown",
+		Data:     []byte("body"),
+		FileName: "AGENTS.md",
+	}}); err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	agentSession.events <- Event{Type: EventResult, Content: sideText, Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil)
+
+	if got := p.getSent(); len(got) != 1 || got[0] != sideText {
+		t.Fatalf("sent text = %#v, want one side-channel message", got)
+	}
+}
+
+func TestProcessInteractiveEvents_DoesNotSuppressDifferentFinalText(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	if err := e.SendToSessionWithAttachments(sessionKey, "已发送 AGENTS.md 文件给你。", nil, []FileAttachment{{
+		MimeType: "text/markdown",
+		Data:     []byte("body"),
+		FileName: "AGENTS.md",
+	}}); err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	finalText := "文件已发出，另外我也把使用方法整理好了。"
+	agentSession.events <- Event{Type: EventResult, Content: finalText, Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil)
+
+	if got := p.getSent(); len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("sent text = %#v, want side-channel and final reply", got)
+	}
+	if got := p.getSent()[1]; got != finalText {
+		t.Fatalf("final sent text = %q, want %q", got, finalText)
+	}
+}
+
+func TestAgentSystemPrompt_MentionsAttachmentSend(t *testing.T) {
+	prompt := AgentSystemPrompt()
+	if !strings.Contains(prompt, "cc-connect send --image") {
+		t.Fatalf("prompt missing image send instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "cc-connect send --file") {
+		t.Fatalf("prompt missing file send instructions: %q", prompt)
+	}
 }
 
 func countCardActionValues(card *Card, prefix string) int {
@@ -679,6 +849,72 @@ func TestEngine_CustomCommand_DisabledByRole(t *testing.T) {
 	}
 }
 
+func TestEngine_SkillCommand_DisabledByRole(t *testing.T) {
+	e := newTestEngine()
+
+	// Create a temporary skill directory with a SKILL.md
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "deploy-prod")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("deploy to production"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.skills.SetDirs([]string{dir})
+
+	urm := NewUserRoleManager()
+	urm.Configure("member", []RoleInput{
+		{Name: "admin", UserIDs: []string{"admin1"}, DisabledCommands: []string{}},
+		{Name: "member", UserIDs: []string{"*"}, DisabledCommands: []string{"deploy-prod"}},
+	})
+	e.SetUserRoles(urm)
+
+	// Member should be blocked from skill command
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: "test:u1", UserID: "user1", ReplyCtx: "ctx"}
+	e.handleCommand(p, msg, "/deploy-prod")
+
+	if len(p.sent) != 1 || (!strings.Contains(p.sent[0], "disabled") && !strings.Contains(p.sent[0], "禁用")) {
+		t.Errorf("skill should be blocked for member, got: %v", p.sent)
+	}
+
+	// Admin should NOT be blocked (but may fail at session level — that's fine,
+	// we only check that the "disabled" message is NOT returned)
+	p2 := &stubPlatformEngine{n: "test"}
+	msg2 := &Message{SessionKey: "test:a1", UserID: "admin1", ReplyCtx: "ctx"}
+	e.handleCommand(p2, msg2, "/deploy-prod")
+
+	for _, s := range p2.sent {
+		if strings.Contains(s, "disabled") || strings.Contains(s, "禁用") {
+			t.Errorf("skill should be allowed for admin, got: %v", p2.sent)
+		}
+	}
+}
+
+func TestEngine_SkillCommand_DisabledByProjectLevel(t *testing.T) {
+	e := newTestEngine()
+
+	dir := t.TempDir()
+	skillDir := filepath.Join(dir, "my-skill")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("a skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.skills.SetDirs([]string{dir})
+	e.SetDisabledCommands([]string{"my-skill"})
+
+	p := &stubPlatformEngine{n: "test"}
+	msg := &Message{SessionKey: "test:u1", UserID: "user1", ReplyCtx: "ctx"}
+	e.handleCommand(p, msg, "/my-skill")
+
+	if len(p.sent) != 1 || (!strings.Contains(p.sent[0], "disabled") && !strings.Contains(p.sent[0], "禁用")) {
+		t.Errorf("skill should be blocked by project-level disabled_commands, got: %v", p.sent)
+	}
+}
+
 // --- role-based rate limit tests ---
 
 func TestEngine_RateLimit_RoleSpecific(t *testing.T) {
@@ -875,10 +1111,12 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	if err := os.MkdirAll(wsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Normalize the path so it matches what resolveWorkspace/getOrCreateWorkspaceAgent will use
+	normalizedWsDir := normalizeWorkspacePath(wsDir)
 	channelID := "C123"
-	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
+	e.workspaceBindings.Bind("project:test", channelID, "chan", normalizedWsDir)
 
-	ws := e.workspacePool.GetOrCreate(wsDir)
+	ws := e.workspacePool.GetOrCreate(normalizedWsDir)
 	ws.agent = &stubListAgent{
 		sessions: []AgentSessionInfo{
 			{ID: "w1", Summary: "Workspace One", MessageCount: 2},
@@ -902,10 +1140,18 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 
 func TestHandlePendingPermission_MultiWorkspaceLookup(t *testing.T) {
 	e := newTestEngine()
-	e.multiWorkspace = true
 
-	sessionKey := "slack:C123:U1"
-	interactiveKey := "/tmp/ws:" + sessionKey
+	// Set up multi-workspace with proper bindings so interactiveKeyForSessionKey works
+	wsDir := t.TempDir()
+	bindingPath := filepath.Join(t.TempDir(), "bindings.json")
+	e.SetMultiWorkspace(t.TempDir(), bindingPath)
+
+	channelID := "C123"
+	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
+
+	sessionKey := "slack:" + channelID + ":U1"
+	// interactiveKeyForSessionKey resolves symlinks, so use the normalized path
+	interactiveKey := normalizeWorkspacePath(wsDir) + ":" + sessionKey
 
 	pending := &pendingPermission{
 		RequestID: "req-1",
@@ -2753,7 +2999,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
 	// The active Session now wants a DIFFERENT agent session ID.
 	session := &Session{AgentSessionID: "new-agent-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent session to be replaced")
@@ -2792,7 +3038,7 @@ func TestSessionMismatch_DoesNotLeakQuiet(t *testing.T) {
 	// Active session wants "new-id", which mismatches "old-id".
 	session := &Session{AgentSessionID: "new-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	state.mu.Lock()
 	q := state.quiet
@@ -2823,7 +3069,7 @@ func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
 
 	session := &Session{AgentSessionID: "matching-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 	if state != existingState {
 		t.Fatal("expected existing state to be reused when session IDs match")
 	}
@@ -2841,7 +3087,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: ""} // empty — no prior binding
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	got := session.GetAgentSessionID()
 
@@ -2861,7 +3107,7 @@ func TestSessionIDWriteback_DoesNotOverwriteExisting(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: "existing-uuid"}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, nil)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil)
 
 	got := session.GetAgentSessionID()
 
@@ -2897,7 +3143,7 @@ func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
 
 	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
 	sessionB := &Session{AgentSessionID: ""}
-	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, nil)
+	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil)
 
 	// Verify S2 is in the map.
 	e.interactiveMu.Lock()
@@ -3058,6 +3304,32 @@ func TestSetupMemoryFile_Idempotent(t *testing.T) {
 	}
 }
 
+func TestSetupMemoryFile_RefreshesLegacyInstructions(t *testing.T) {
+	tmpDir := t.TempDir()
+	memFile := filepath.Join(tmpDir, "AGENTS.md")
+	legacy := "\n" + ccConnectInstructionMarker + "\nlegacy instructions\n"
+	if err := os.WriteFile(memFile, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("write legacy mem file: %v", err)
+	}
+
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubMemoryAgent{memFile: memFile}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	result, _, err := e.setupMemoryFile()
+	if result != setupOK {
+		t.Fatalf("result = %d, want setupOK; err = %v", result, err)
+	}
+
+	content, _ := os.ReadFile(memFile)
+	if strings.Contains(string(content), "legacy instructions") {
+		t.Fatalf("legacy instructions should be refreshed, got %q", string(content))
+	}
+	if !strings.Contains(string(content), "cc-connect send --image") {
+		t.Fatalf("expected refreshed attachment instructions, got %q", string(content))
+	}
+}
+
 func TestSetupMemoryFile_NativeAgent(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	agent := &stubNativePromptAgent{}
@@ -3098,8 +3370,8 @@ func TestCmdCronSetup_WritesAndReplies(t *testing.T) {
 	if !strings.Contains(p.sent[0], "AGENTS.md") {
 		t.Errorf("reply = %q, want to contain filename", p.sent[0])
 	}
-	if !strings.Contains(p.sent[0], "natural language") {
-		t.Errorf("reply = %q, want cron-specific success message", p.sent[0])
+	if !strings.Contains(p.sent[0], "attachment send-back") {
+		t.Errorf("reply = %q, want unified cc-connect setup success message", p.sent[0])
 	}
 
 	content, _ := os.ReadFile(memFile)
@@ -3192,6 +3464,252 @@ func TestDrainEventsOpenChannel(t *testing.T) {
 	case <-ch:
 		t.Fatal("expected channel to be drained")
 	default:
+	}
+}
+
+// --- Message queuing tests ---
+
+// queuingAgentSession records Send calls and emits events via a controllable channel.
+type queuingAgentSession struct {
+	controllableAgentSession
+	sendCalls []string
+	sendMu    sync.Mutex
+}
+
+func newQueuingSession(id string) *queuingAgentSession {
+	return &queuingAgentSession{
+		controllableAgentSession: controllableAgentSession{
+			sessionID: id,
+			alive:     true,
+			events:    make(chan Event, 16),
+			closed:    make(chan struct{}),
+		},
+	}
+}
+
+func (s *queuingAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.sendMu.Lock()
+	s.sendCalls = append(s.sendCalls, prompt)
+	s.sendMu.Unlock()
+	return nil
+}
+
+func TestQueueMessageForBusySession_FIFODequeue(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs1")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+
+	// Set up an interactive state as if a turn is in progress.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx1",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Queue two messages while the session is "busy".
+	msg1 := &Message{SessionKey: key, Content: "msg1", ReplyCtx: "ctx-msg1"}
+	msg2 := &Message{SessionKey: key, Content: "msg2", ReplyCtx: "ctx-msg2"}
+
+	ok1 := e.queueMessageForBusySession(p, msg1, key)
+	ok2 := e.queueMessageForBusySession(p, msg2, key)
+
+	if !ok1 || !ok2 {
+		t.Fatal("expected both messages to be queued successfully")
+	}
+
+	// Since deferred-send, messages are NOT sent to agent stdin at queue
+	// time — only metadata is stored. Verify no Send calls occurred.
+	sess.sendMu.Lock()
+	if len(sess.sendCalls) != 0 {
+		t.Fatalf("sendCalls = %v, want [] (deferred send)", sess.sendCalls)
+	}
+	sess.sendMu.Unlock()
+
+	// Verify pending messages queue has correct FIFO order.
+	state.mu.Lock()
+	if len(state.pendingMessages) != 2 {
+		t.Fatalf("pendingMessages len = %d, want 2", len(state.pendingMessages))
+	}
+	if state.pendingMessages[0].content != "msg1" || state.pendingMessages[1].content != "msg2" {
+		t.Fatalf("pendingMessages = [%s, %s], want [msg1, msg2]",
+			state.pendingMessages[0].content, state.pendingMessages[1].content)
+	}
+	state.mu.Unlock()
+}
+
+func TestProcessInteractiveEvents_DrainsQueuedMessages(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs2")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	session := e.sessions.GetOrCreateActive(key)
+
+	// Pre-populate the interactive state with one queued message.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx-turn1",
+		pendingMessages: []queuedMessage{
+			{platform: p, replyCtx: "ctx-turn2", content: "queued-msg"},
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Simulate the agent completing turn 1 then turn 2.
+	// Turn 2 events are pushed only after Send() is called for the queued
+	// message, matching real-world timing where the agent doesn't produce
+	// events for a turn until it receives the prompt on stdin.
+	go func() {
+		// Turn 1 result
+		sess.events <- Event{Type: EventText, Content: "response1"}
+		sess.events <- Event{Type: EventResult, Content: "response1", Done: true}
+		// Wait for the queued message's Send() call before pushing turn 2 events.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) == 0 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+		// Turn 2 result (for the queued message)
+		sess.events <- Event{Type: EventText, Content: "response2"}
+		sess.events <- Event{Type: EventResult, Content: "response2", Done: true}
+	}()
+
+	session.AddHistory("user", "initial-msg")
+
+	// processInteractiveEvents should handle both turns.
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(5 * time.Second):
+		t.Fatal("processInteractiveEvents did not complete in time")
+	}
+
+	// Verify queue is empty after processing.
+	state.mu.Lock()
+	remaining := len(state.pendingMessages)
+	state.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("pendingMessages after processing = %d, want 0", remaining)
+	}
+
+	// Verify both turns recorded in session history.
+	history := session.GetHistory(100)
+	var assistantMsgs []string
+	for _, h := range history {
+		if h.Role == "assistant" {
+			assistantMsgs = append(assistantMsgs, h.Content)
+		}
+	}
+	if len(assistantMsgs) != 2 {
+		t.Fatalf("assistant history entries = %d, want 2", len(assistantMsgs))
+	}
+
+	// Verify the queued message was also added to history.
+	var userMsgs []string
+	for _, h := range history {
+		if h.Role == "user" {
+			userMsgs = append(userMsgs, h.Content)
+		}
+	}
+	if len(userMsgs) < 2 {
+		t.Fatalf("user history entries = %d, want >= 2", len(userMsgs))
+	}
+}
+
+// TestDrainOrphanedQueue_UsesWorkspaceSessionManager verifies that
+// drainOrphanedQueue saves session history through the passed sessions
+// manager (workspace-specific) rather than e.sessions (global).
+func TestDrainOrphanedQueue_UsesWorkspaceSessionManager(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("qs-orphan")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	// Create a separate "workspace" session manager that drainOrphanedQueue should use.
+	wsSessionsPath := filepath.Join(t.TempDir(), "ws_sessions.json")
+	wsSessions := NewSessionManager(wsSessionsPath)
+
+	key := "ws1:test:user1"
+	session := wsSessions.GetOrCreateActive("test:user1")
+	if !session.TryLock() {
+		t.Fatal("expected TryLock to succeed")
+	}
+
+	// Set up interactive state with a queued message.
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		pendingMessages: []queuedMessage{
+			{platform: p, replyCtx: "ctx-q", content: "queued-orphan"},
+		},
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Push events so the drain completes.
+	go func() {
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) == 0 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+		sess.events <- Event{Type: EventResult, Content: "orphan-response", Done: true}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		e.drainOrphanedQueue(session, wsSessions, key, agent, "")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drainOrphanedQueue did not complete in time")
+	}
+
+	// The assistant response should be saved in the workspace session manager,
+	// NOT in e.sessions (global).
+	wsHistory := wsSessions.GetOrCreateActive("test:user1").GetHistory(0)
+	var wsAssistant []string
+	for _, h := range wsHistory {
+		if h.Role == "assistant" {
+			wsAssistant = append(wsAssistant, h.Content)
+		}
+	}
+	if len(wsAssistant) == 0 {
+		t.Fatal("expected assistant history in workspace session manager, got none")
+	}
+
+	// Verify e.sessions (global) does NOT have this history.
+	globalSession := e.sessions.GetOrCreateActive("test:user1")
+	globalHistory := globalSession.GetHistory(0)
+	for _, h := range globalHistory {
+		if h.Role == "assistant" && h.Content == "orphan-response" {
+			t.Fatal("orphan response was saved to global e.sessions instead of workspace sessions")
+		}
 	}
 }
 

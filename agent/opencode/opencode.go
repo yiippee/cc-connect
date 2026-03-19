@@ -32,7 +32,7 @@ type Agent struct {
 	providers  []core.ProviderConfig
 	activeIdx  int
 	sessionEnv []string
-	mu         sync.Mutex
+	mu         sync.RWMutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -98,7 +98,16 @@ func (a *Agent) GetModel() string {
 	return a.model
 }
 
+func (a *Agent) configuredModels() []core.ModelOption {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return core.GetProviderModels(a.providers, a.activeIdx)
+}
+
 func (a *Agent) AvailableModels(_ context.Context) []core.ModelOption {
+	if models := a.configuredModels(); len(models) > 0 {
+		return models
+	}
 	return []core.ModelOption{
 		{Name: "anthropic/claude-sonnet-4-20250514", Desc: "Claude Sonnet 4 (default)"},
 		{Name: "anthropic/claude-opus-4-20250514", Desc: "Claude Opus 4"},

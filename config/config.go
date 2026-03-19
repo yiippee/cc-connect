@@ -19,6 +19,7 @@ var ConfigPath string
 
 type Config struct {
 	DataDir         string              `toml:"data_dir"` // session store directory, default ~/.cc-connect
+	AttachmentSend  string              `toml:"attachment_send"`
 	Projects        []ProjectConfig     `toml:"projects"`
 	Commands        []CommandConfig     `toml:"commands"`     // global custom slash commands
 	Aliases         []AliasConfig       `toml:"aliases"`      // global command aliases
@@ -30,6 +31,7 @@ type Config struct {
 	Display         DisplayConfig       `toml:"display"`
 	StreamPreview   StreamPreviewConfig `toml:"stream_preview"`  // real-time streaming preview
 	RateLimit       RateLimitConfig     `toml:"rate_limit"`      // per-session rate limiting
+	Relay           RelayConfig         `toml:"relay"`           // bot-to-bot relay behavior
 	Quiet           *bool               `toml:"quiet,omitempty"` // global default for quiet mode; project-level overrides this
 	Cron            CronConfig          `toml:"cron"`
 	Webhook         WebhookConfig       `toml:"webhook"`
@@ -56,7 +58,8 @@ type BridgeConfig struct {
 	Enabled *bool  `toml:"enabled"`         // default false
 	Port    int    `toml:"port,omitempty"`  // listen port; default 9810
 	Token   string `toml:"token,omitempty"` // shared secret for authentication; required
-	Path    string `toml:"path,omitempty"`  // URL path; default "/bridge/ws"
+	Path        string   `toml:"path,omitempty"`         // URL path; default "/bridge/ws"
+	CORSOrigins []string `toml:"cors_origins,omitempty"` // allowed CORS origins; empty = no CORS
 }
 
 // ManagementConfig controls the HTTP Management API for external tools.
@@ -101,6 +104,11 @@ type RoleConfig struct {
 	RateLimit        *RateLimitConfig `toml:"rate_limit,omitempty"` // nil = inherit global
 }
 
+// RelayConfig controls bot-to-bot relay behavior.
+type RelayConfig struct {
+	TimeoutSecs *int `toml:"timeout_secs"` // max seconds to wait for relay response; 0 = disabled; default 120
+}
+
 // SpeechConfig configures speech-to-text for voice messages.
 type SpeechConfig struct {
 	Enabled  bool   `toml:"enabled"`
@@ -124,12 +132,12 @@ type SpeechConfig struct {
 
 // TTSConfig configures text-to-speech output (mirrors SpeechConfig style).
 type TTSConfig struct {
-	Enabled    bool   `toml:"enabled"`
-	Provider   string `toml:"provider"`     // "qwen" | "openai" | "minimax"
-	Voice      string `toml:"voice"`        // default voice name
-	TTSMode    string `toml:"tts_mode"`     // "voice_only" (default) | "always"
-	MaxTextLen int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
-	OpenAI     struct {
+	Enabled     bool   `toml:"enabled"`
+	Provider    string `toml:"provider"`     // "qwen" | "openai" | "minimax" | "espeak" | "pico" | "edge"
+	Voice       string `toml:"voice"`        // default voice name (for edge: "zh-CN-XiaoxiaoNeural"; for pico: "zh-CN"; for espeak: "zh")
+	TTSMode     string `toml:"tts_mode"`     // "voice_only" (default) | "always"
+	MaxTextLen  int    `toml:"max_text_len"` // max rune count before skipping TTS; 0 = no limit
+	OpenAI      struct {
 		APIKey  string `toml:"api_key"`
 		BaseURL string `toml:"base_url"`
 		Model   string `toml:"model"`
@@ -178,13 +186,21 @@ type AgentConfig struct {
 	Providers []ProviderConfig `toml:"providers"`
 }
 
+// ProviderModelConfig defines a selectable model entry for a provider,
+// with an optional short alias used by the /model command.
+type ProviderModelConfig struct {
+	Model string `toml:"model"`
+	Alias string `toml:"alias,omitempty"`
+}
+
 type ProviderConfig struct {
-	Name     string            `toml:"name"`
-	APIKey   string            `toml:"api_key"`
-	BaseURL  string            `toml:"base_url,omitempty"`
-	Model    string            `toml:"model,omitempty"`
-	Thinking string            `toml:"thinking,omitempty"`
-	Env      map[string]string `toml:"env,omitempty"`
+	Name     string                `toml:"name"`
+	APIKey   string                `toml:"api_key"`
+	BaseURL  string                `toml:"base_url,omitempty"`
+	Model    string                `toml:"model,omitempty"`
+	Models   []ProviderModelConfig `toml:"models,omitempty"`
+	Thinking string                `toml:"thinking,omitempty"`
+	Env      map[string]string     `toml:"env,omitempty"`
 }
 
 type PlatformConfig struct {
@@ -231,6 +247,10 @@ func Load(path string) (*Config, error) {
 			cfg.DataDir = ".cc-connect"
 		}
 	}
+	cfg.AttachmentSend = strings.ToLower(strings.TrimSpace(cfg.AttachmentSend))
+	if cfg.AttachmentSend == "" {
+		cfg.AttachmentSend = "on"
+	}
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -239,6 +259,14 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	switch strings.ToLower(strings.TrimSpace(c.AttachmentSend)) {
+	case "", "on", "off":
+	default:
+		return fmt.Errorf("config: attachment_send must be \"on\" or \"off\"")
+	}
+	if c.Relay.TimeoutSecs != nil && *c.Relay.TimeoutSecs < 0 {
+		return fmt.Errorf("config: relay.timeout_secs must be >= 0")
+	}
 	if len(c.Projects) == 0 {
 		return fmt.Errorf("config: at least one [[projects]] entry is required")
 	}
@@ -1007,6 +1035,7 @@ func cloneAgentConfig(in AgentConfig) AgentConfig {
 				APIKey:   in.Providers[i].APIKey,
 				BaseURL:  in.Providers[i].BaseURL,
 				Model:    in.Providers[i].Model,
+				Models:   append([]ProviderModelConfig(nil), in.Providers[i].Models...),
 				Thinking: in.Providers[i].Thinking,
 				Env:      cloneStringMap(in.Providers[i].Env),
 			}
