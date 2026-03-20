@@ -56,7 +56,9 @@ type RestartRequest struct {
 // a "restart successful" message after startup.
 func SaveRestartNotify(dataDir string, req RestartRequest) error {
 	dir := filepath.Join(dataDir, "run")
-	os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("SaveRestartNotify: mkdir failed", "dir", dir, "error", err)
+	}
 	data, _ := json.Marshal(req)
 	return os.WriteFile(filepath.Join(dir, "restart_notify"), data, 0o644)
 }
@@ -1628,11 +1630,7 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	return agent, sessions, nil
 }
 
-func (e *Engine) getOrCreateInteractiveState(sessionKey string, p Platform, replyCtx any, session *Session) *interactiveState {
-	return e.getOrCreateInteractiveStateWith(sessionKey, p, replyCtx, session, e.sessions, nil)
-}
-
-// getOrCreateInteractiveStateWith is like getOrCreateInteractiveState but accepts
+// getOrCreateInteractiveStateWith accepts
 // an optional agent override for multi-workspace mode. When agentOverride is non-nil
 // it is used instead of e.agent to start the session.
 func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, replyCtx any, session *Session, sessions *SessionManager, agentOverride Agent) *interactiveState {
@@ -1694,12 +1692,14 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	}
 
 	// Inject platform-specific formatting instructions into the agent's system prompt.
+	// Clear the prompt first so instructions from a previous platform don't leak
+	// into sessions for platforms that don't provide their own instructions.
 	if ppi, ok := agent.(PlatformPromptInjector); ok {
+		prompt := ""
 		if fip, ok := p.(FormattingInstructionProvider); ok {
-			ppi.SetPlatformPrompt(fip.FormattingInstructions())
-		} else {
-			ppi.SetPlatformPrompt("")
+			prompt = fip.FormattingInstructions()
 		}
+		ppi.SetPlatformPrompt(prompt)
 	}
 
 	// Check if context is already canceled (e.g. during shutdown/restart)
@@ -2361,6 +2361,7 @@ var builtinCommands = []struct {
 	{[]string{"dir", "cd", "chdir", "workdir"}, "dir"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"workspace", "ws"}, "workspace"},
+	{[]string{"whoami", "myid"}, "whoami"},
 }
 
 // isBtwCommand checks if a trimmed message starts with a /btw command.
@@ -2553,6 +2554,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		}
 		e.handleWorkspaceCommand(p, msg, args)
 		return true
+	case "whoami":
+		e.cmdWhoami(p, msg)
 	default:
 		if custom, ok := e.commands.Resolve(cmd); ok {
 			if disabledCmds[strings.ToLower(custom.Name)] {
@@ -3257,6 +3260,11 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 
 		sessionKeyStr := e.i18n.Tf(MsgStatusSessionKey, msg.SessionKey)
 
+		userIDStr := ""
+		if msg.UserID != "" {
+			userIDStr = e.i18n.Tf(MsgStatusUserID, msg.UserID)
+		}
+
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgStatusTitle,
 			e.name,
 			agent.Name(),
@@ -3267,11 +3275,12 @@ func (e *Engine) cmdStatus(p Platform, msg *Message) {
 			sessionStr,
 			cronStr,
 			sessionKeyStr,
+			userIDStr,
 		))
 		return
 	}
 
-	e.replyWithCard(p, msg.ReplyCtx, e.renderStatusCard(msg.SessionKey))
+	e.replyWithCard(p, msg.ReplyCtx, e.renderStatusCard(msg.SessionKey, msg.UserID))
 }
 
 func (e *Engine) cmdUsage(p Platform, msg *Message) {
@@ -3580,7 +3589,7 @@ func (e *Engine) renderListCardSafe(sessionKey string, page int) *Card {
 	return card
 }
 
-func (e *Engine) renderStatusCard(sessionKey string) *Card {
+func (e *Engine) renderStatusCard(sessionKey string, userID string) *Card {
 	agent, sessions := e.sessionContextForKey(sessionKey)
 	platNames := make([]string, len(e.platforms))
 	for i, pl := range e.platforms {
@@ -3648,6 +3657,11 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 
 	sessionKeyStr := e.i18n.Tf(MsgStatusSessionKey, sessionKey)
 
+	userIDStr := ""
+	if userID != "" {
+		userIDStr = e.i18n.Tf(MsgStatusUserID, userID)
+	}
+
 	statusText := e.i18n.Tf(MsgStatusTitle,
 		e.name,
 		agent.Name(),
@@ -3658,6 +3672,7 @@ func (e *Engine) renderStatusCard(sessionKey string) *Card {
 		sessionStr,
 		cronStr,
 		sessionKeyStr,
+		userIDStr,
 	)
 	title, body := splitCardTitleBody(statusText)
 
@@ -5009,11 +5024,6 @@ func (e *Engine) sendAskQuestionPrompt(p Platform, replyCtx any, questions []Use
 		titleSuffix = fmt.Sprintf(" (%d/%d)", qIdx+1, total)
 	}
 
-	headerText := q.Header
-	if headerText == "" {
-		headerText = q.Question
-	}
-
 	// Try card (Feishu/Lark)
 	if supportsCards(p) {
 		cb := NewCard().Title(e.i18n.T(MsgAskQuestionTitle)+titleSuffix, "blue")
@@ -5152,13 +5162,6 @@ func (e *Engine) replyWithButtons(p Platform, replyCtx any, content string, butt
 	e.reply(p, replyCtx, content)
 }
 
-func isInlineButtonOnlyPlatform(p Platform) bool {
-	if _, ok := p.(InlineButtonSender); !ok {
-		return false
-	}
-	return !supportsCards(p)
-}
-
 func supportsCards(p Platform) bool {
 	_, ok := p.(CardSender)
 	return ok
@@ -5232,7 +5235,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	case "/lang":
 		return e.renderLangCard()
 	case "/status":
-		return e.renderStatusCard(sessionKey)
+		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
 	case "/list":
 		page := 1
 		if args != "" {
@@ -5261,12 +5264,18 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderSkillsCard()
 	case "/doctor":
 		return e.renderDoctorCard()
+	case "/whoami":
+		return e.renderWhoamiCard(&Message{
+			SessionKey: sessionKey,
+			UserID:     extractUserID(sessionKey),
+			Platform:   extractPlatformName(sessionKey),
+		})
 	case "/version":
 		return e.renderVersionCard()
 	case "/new":
 		return e.renderCurrentCard(sessionKey)
 	case "/quiet":
-		return e.renderStatusCard(sessionKey)
+		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
 	case "/switch":
 		return e.renderListCardSafe(sessionKey, 1)
 	case "/delete-mode":
@@ -5275,7 +5284,7 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		}
 		return e.renderDeleteModeCard(sessionKey)
 	case "/stop":
-		return e.renderStatusCard(sessionKey)
+		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
 	case "/upgrade":
 		return e.renderUpgradeCard()
 	}
@@ -5552,19 +5561,6 @@ func (e *Engine) getDeleteModeState(sessionKey string) *deleteModeState {
 		cp.selectedIDs[id] = struct{}{}
 	}
 	return cp
-}
-
-func (e *Engine) clearDeleteModeState(sessionKey string) {
-	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
-	e.interactiveMu.Lock()
-	state := e.interactiveStates[interactiveKey]
-	e.interactiveMu.Unlock()
-	if state == nil {
-		return
-	}
-	state.mu.Lock()
-	state.deleteMode = nil
-	state.mu.Unlock()
 }
 
 func (e *Engine) renderDeleteModeCard(sessionKey string) *Card {
@@ -7368,6 +7364,73 @@ func (e *Engine) cmdConfig(p Platform, msg *Message, args []string) {
 	}
 }
 
+// ── /whoami command ─────────────────────────────────────────
+
+func (e *Engine) cmdWhoami(p Platform, msg *Message) {
+	if supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderWhoamiCard(msg))
+		return
+	}
+	e.reply(p, msg.ReplyCtx, e.formatWhoamiText(msg))
+}
+
+func (e *Engine) formatWhoamiText(msg *Message) string {
+	var sb strings.Builder
+	sb.WriteString(e.i18n.T(MsgWhoamiTitle))
+	sb.WriteString("\n")
+
+	if msg.UserID != "" {
+		sb.WriteString(fmt.Sprintf("User ID: `%s`\n", msg.UserID))
+	} else {
+		sb.WriteString("User ID: (unknown)\n")
+	}
+	if msg.UserName != "" {
+		sb.WriteString(fmt.Sprintf("Name: %s\n", msg.UserName))
+	}
+	if msg.Platform != "" {
+		sb.WriteString(fmt.Sprintf("Platform: %s\n", msg.Platform))
+	}
+
+	chatID := extractChannelID(msg.SessionKey)
+	if chatID != "" {
+		sb.WriteString(fmt.Sprintf("Chat ID: `%s`\n", chatID))
+	}
+	sb.WriteString(fmt.Sprintf("Session Key: `%s`\n", msg.SessionKey))
+
+	sb.WriteString("\n")
+	sb.WriteString(e.i18n.T(MsgWhoamiUsage))
+	return sb.String()
+}
+
+func (e *Engine) renderWhoamiCard(msg *Message) *Card {
+	userID := msg.UserID
+	if userID == "" {
+		userID = "(unknown)"
+	}
+
+	var body strings.Builder
+	body.WriteString(fmt.Sprintf("**User ID:**  `%s`\n", userID))
+	if msg.UserName != "" {
+		body.WriteString(fmt.Sprintf("**%s:**  %s\n", e.i18n.T(MsgWhoamiName), msg.UserName))
+	}
+	if msg.Platform != "" {
+		body.WriteString(fmt.Sprintf("**%s:**  %s\n", e.i18n.T(MsgWhoamiPlatform), msg.Platform))
+	}
+	chatID := extractChannelID(msg.SessionKey)
+	if chatID != "" {
+		body.WriteString(fmt.Sprintf("**Chat ID:**  `%s`\n", chatID))
+	}
+	body.WriteString(fmt.Sprintf("**Session Key:**  `%s`\n", msg.SessionKey))
+
+	return NewCard().
+		Title(e.i18n.T(MsgWhoamiCardTitle), "blue").
+		Markdown(body.String()).
+		Divider().
+		Note(e.i18n.T(MsgWhoamiUsage)).
+		Buttons(e.cardBackButton()).
+		Build()
+}
+
 // ── /doctor command ─────────────────────────────────────────
 
 func (e *Engine) cmdDoctor(p Platform, msg *Message) {
@@ -8183,6 +8246,21 @@ func extractChannelID(sessionKey string) string {
 		return parts[1]
 	}
 	return ""
+}
+
+func extractUserID(sessionKey string) string {
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return ""
+}
+
+func extractPlatformName(sessionKey string) string {
+	if i := strings.IndexByte(sessionKey, ':'); i >= 0 {
+		return sessionKey[:i]
+	}
+	return sessionKey
 }
 
 // commandContext resolves the appropriate agent, session manager, and interactive key

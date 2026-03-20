@@ -21,10 +21,63 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkcontact "github.com/larksuite/oapi-sdk-go/v3/service/contact/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
+
+// sanitizingLogger wraps a logger and masks sensitive URL parameters.
+type sanitizingLogger struct {
+	inner larkcore.Logger
+}
+
+func (l *sanitizingLogger) maskURL(args ...interface{}) []interface{} {
+	masked := make([]interface{}, len(args))
+	for i, arg := range args {
+		if s, ok := arg.(string); ok {
+			masked[i] = l.sanitize(s)
+		} else {
+			masked[i] = arg
+		}
+	}
+	return masked
+}
+
+func (l *sanitizingLogger) sanitize(s string) string {
+	// Mask sensitive query parameters in URLs
+	sensitiveParams := []string{
+		"device_id=", "access_key=", "ticket=", "conn_id=",
+		"secret=", "token=", "password=", "key=",
+	}
+	for _, param := range sensitiveParams {
+		if idx := strings.Index(s, param); idx != -1 {
+			// Find the end of the value (either & or end of string)
+			end := idx + len(param)
+			for end < len(s) && s[end] != '&' && s[end] != ' ' {
+				end++
+			}
+			s = s[:idx+len(param)] + "***" + s[end:]
+		}
+	}
+	return s
+}
+
+func (l *sanitizingLogger) Debug(ctx context.Context, args ...interface{}) {
+	l.inner.Debug(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Info(ctx context.Context, args ...interface{}) {
+	l.inner.Info(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Warn(ctx context.Context, args ...interface{}) {
+	l.inner.Warn(ctx, l.maskURL(args...)...)
+}
+
+func (l *sanitizingLogger) Error(ctx context.Context, args ...interface{}) {
+	l.inner.Error(ctx, l.maskURL(args...)...)
+}
 
 func init() {
 	core.RegisterPlatform("feishu", func(opts map[string]any) (core.Platform, error) {
@@ -194,6 +247,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		}).
 		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 			return p.onCardAction(event)
+		}).
+		OnP2BotMenuV6(func(ctx context.Context, event *larkapplication.P2BotMenuV6) error {
+			return p.onBotMenu(event)
 		})
 
 	// Lark international version uses Webhook mode, not WebSocket long connection
@@ -210,6 +266,7 @@ func (p *Platform) startWebSocketMode() error {
 	wsOpts := []larkws.ClientOption{
 		larkws.WithEventHandler(p.eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
+		larkws.WithLogger(&sanitizingLogger{inner: larkcore.NewEventLogger()}),
 	}
 	if p.domain != lark.FeishuBaseUrl {
 		wsOpts = append(wsOpts, larkws.WithDomain(p.domain))
@@ -275,7 +332,7 @@ func (p *Platform) webhookHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(resp.Body)
+	_, _ = w.Write(resp.Body)
 }
 
 // onCardAction handles card.action.trigger callbacks via the official SDK event dispatcher.
@@ -1392,7 +1449,6 @@ func parseInlineMarkdown(line string) []map[string]any {
 		pattern string
 		tag     string
 		style   string // for text elements with style
-		isLink  bool
 	}
 	markers := []markerDef{
 		{pattern: "**", tag: "text", style: "bold"},
@@ -1932,4 +1988,49 @@ func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string,
 		}
 	}
 	return textParts, images
+}
+
+// onBotMenu handles bot custom menu click events. When a menu item's
+// event_key starts with "/", it is dispatched as a slash command.
+// This allows users to configure menu items in the Feishu developer
+// console with event_key set to commands like "/help", "/status", etc.
+func (p *Platform) onBotMenu(event *larkapplication.P2BotMenuV6) error {
+	if event == nil || event.Event == nil || event.Event.EventKey == nil {
+		return nil
+	}
+	eventKey := *event.Event.EventKey
+
+	userID := ""
+	if event.Event.Operator != nil && event.Event.Operator.OperatorId != nil && event.Event.Operator.OperatorId.OpenId != nil {
+		userID = *event.Event.Operator.OperatorId.OpenId
+	}
+	if userID == "" {
+		slog.Debug(p.tag()+": bot menu event without user id", "event_key", eventKey)
+		return nil
+	}
+
+	if !core.AllowList(p.allowFrom, userID) {
+		slog.Debug(p.tag()+": menu event from unauthorized user", "user", userID, "event_key", eventKey)
+		return nil
+	}
+
+	slog.Info(p.tag()+": bot menu clicked", "event_key", eventKey, "user", userID)
+
+	content := eventKey
+	if !strings.HasPrefix(content, "/") {
+		content = "/" + content
+	}
+
+	userName := p.resolveUserName(userID)
+	sessionKey := p.platformName + ":" + userID + ":" + userID
+
+	p.handler(p.dispatchPlatform(), &core.Message{
+		SessionKey: sessionKey,
+		Platform:   p.platformName,
+		Content:    content,
+		UserID:     userID,
+		UserName:   userName,
+		ReplyCtx:   replyContext{chatID: userID, sessionKey: sessionKey},
+	})
+	return nil
 }
