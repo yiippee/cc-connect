@@ -45,13 +45,13 @@ func TestBuildExecArgs_IncludesReasoningEffort(t *testing.T) {
 
 	want := []string{
 		"exec",
-		"--json",
 		"--skip-git-repo-check",
 		"--full-auto",
 		"--model",
 		"o3",
 		"-c",
 		`model_reasoning_effort="high"`,
+		"--json",
 		"--cd",
 		"/tmp/project",
 		"hello",
@@ -63,6 +63,27 @@ func TestBuildExecArgs_IncludesReasoningEffort(t *testing.T) {
 		if args[i] != want[i] {
 			t.Fatalf("args[%d] = %q, want %q, args=%v", i, args[i], want[i], args)
 		}
+	}
+}
+
+func TestBuildExecArgs_ResumeOmitsCdFlag(t *testing.T) {
+	cs, err := newCodexSession(context.Background(), "/tmp/project", "", "", "full-auto", "thread-abc", nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+
+	args := cs.buildExecArgs("hello", nil)
+
+	// codex exec resume does not support --cd; verify it's absent.
+	for i, arg := range args {
+		if arg == "--cd" {
+			t.Fatalf("resume args should not contain --cd, but found at index %d: %v", i, args)
+		}
+	}
+
+	// --json and prompt must still be present.
+	if !containsSequence(args, []string{"--json", "hello"}) {
+		t.Fatalf("resume args missing --json + prompt: %v", args)
 	}
 }
 
@@ -102,8 +123,11 @@ func TestSend_WithImages_PassesImageArgsAndDefaultPrompt(t *testing.T) {
 	}
 
 	args := waitForArgsFile(t, argsFile)
-	if !containsSequence(args, []string{"exec", "--json", "--skip-git-repo-check"}) {
+	if !containsSequence(args, []string{"exec", "--skip-git-repo-check"}) {
 		t.Fatalf("args missing exec prelude: %v", args)
+	}
+	if !containsSequence(args, []string{"--json", "--cd"}) {
+		t.Fatalf("args missing --json --cd sequence: %v", args)
 	}
 	imagePath := valueAfter(args, "--image")
 	if imagePath == "" {
@@ -154,16 +178,18 @@ func TestSend_ResumeWithImages_PlacesSessionBeforeImageFlags(t *testing.T) {
 	}
 
 	args := waitForArgsFile(t, argsFile)
-	if !containsSequence(args, []string{"exec", "resume", "--json", "--skip-git-repo-check"}) {
+	if !containsSequence(args, []string{"exec", "resume", "--skip-git-repo-check"}) {
 		t.Fatalf("args missing resume prelude: %v", args)
 	}
 	tidIndex := indexOf(args, "thread-123")
 	imageIndex := indexOf(args, "--image")
+	jsonIndex := indexOf(args, "--json")
 	promptIndex := indexOf(args, "describe this")
-	if tidIndex == -1 || imageIndex == -1 || promptIndex == -1 {
-		t.Fatalf("missing resume/image/prompt args: %v", args)
+	if tidIndex == -1 || imageIndex == -1 || jsonIndex == -1 || promptIndex == -1 {
+		t.Fatalf("missing resume/image/json/prompt args: %v", args)
 	}
-	if !(tidIndex < imageIndex && imageIndex < promptIndex) {
+	// Verify order: thread-id -> --image -> --json -> --cd -> prompt
+	if !(tidIndex < imageIndex && imageIndex < jsonIndex && jsonIndex < promptIndex) {
 		t.Fatalf("unexpected arg order: %v", args)
 	}
 }
@@ -321,4 +347,16 @@ func indexOf(args []string, target string) int {
 		}
 	}
 	return -1
+}
+
+func TestCodexSession_ContinueSessionTreatedAsFresh(t *testing.T) {
+	s, err := newCodexSession(context.Background(), "/tmp", "", "", "full-auto", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.CurrentSessionID(); got != "" {
+		t.Errorf("ContinueSession should be treated as fresh: threadID = %q, want empty", got)
+	}
 }

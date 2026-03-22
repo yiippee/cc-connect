@@ -318,6 +318,19 @@ func main() {
 			engine.SetDefaultQuiet(*cfg.Quiet)
 		}
 
+		// Wire auto-compress settings
+		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
+			minGap := 30 * time.Minute
+			if proj.AutoCompress.MinGapMins != nil {
+				minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
+			}
+			maxTokens := derefInt(proj.AutoCompress.MaxTokens)
+			if maxTokens <= 0 {
+				maxTokens = 12000
+			}
+			engine.SetAutoCompressConfig(true, maxTokens, minGap)
+		}
+
 		// Wire sender injection
 		if proj.InjectSender != nil {
 			engine.SetInjectSender(*proj.InjectSender)
@@ -466,6 +479,9 @@ func main() {
 		engine.SetProviderRemoveSaveFunc(func(name string) error {
 			return config.RemoveProviderFromConfig(projName, name)
 		})
+		engine.SetProviderModelSaveFunc(func(providerName, model string) error {
+			return config.SaveProviderModel(projName, providerName, model)
+		})
 
 		// Wire config reload
 		capturedEngine := engine
@@ -600,9 +616,21 @@ func main() {
 			}
 		}
 		apiSrv.SetRelayManager(relayMgr)
+
+		// Create shared DirHistory for all engines
+		dirHistory := core.NewDirHistory(cfg.DataDir)
+
 		for i, e := range engines {
 			apiSrv.RegisterEngine(cfg.Projects[i].Name, e)
 			e.SetRelayManager(relayMgr)
+			e.SetDirHistory(dirHistory)
+
+			// Ensure initial work_dir is in history
+			if initWorkDir, _ := cfg.Projects[i].Agent.Options["work_dir"].(string); initWorkDir != "" {
+				if !dirHistory.Contains(cfg.Projects[i].Name, initWorkDir) {
+					dirHistory.Add(cfg.Projects[i].Name, initWorkDir)
+				}
+			}
 		}
 		if cronSched != nil {
 			apiSrv.SetCronScheduler(cronSched)
@@ -918,6 +946,21 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetDefaultQuiet(false)
 	}
 
+	// Reload auto-compress settings
+	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
+		minGap := 30 * time.Minute
+		if proj.AutoCompress.MinGapMins != nil {
+			minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
+		}
+		maxTokens := derefInt(proj.AutoCompress.MaxTokens)
+		if maxTokens <= 0 {
+			maxTokens = 12000
+		}
+		engine.SetAutoCompressConfig(true, maxTokens, minGap)
+	} else {
+		engine.SetAutoCompressConfig(false, 0, 0)
+	}
+
 	// Reload sender injection
 	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
 
@@ -1054,4 +1097,11 @@ func buildHeartbeatConfig(hc config.HeartbeatConfig) core.HeartbeatConfig {
 		cfg.TimeoutMins = *hc.TimeoutMins
 	}
 	return cfg
+}
+
+func derefInt(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }

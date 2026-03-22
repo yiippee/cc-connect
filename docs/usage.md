@@ -34,7 +34,7 @@ Each user gets an independent session with full conversation context. Manage ses
 | `/history [n]` | Show last n messages (default 10) |
 | `/usage` | Show account/model quota usage (if supported) |
 | `/provider [...]` | Manage API providers |
-| `/model [alias]` | List available models or switch by alias |
+| `/model [switch <alias>]` | List available models or switch by alias |
 | `/allow <tool>` | Pre-allow a tool (next session) |
 | `/reasoning [level]` | View or switch reasoning effort (Codex) |
 | `/mode [name]` | View or switch permission mode |
@@ -216,8 +216,9 @@ alias = "spark"
 
 ```
 /model              List available models (format: alias - model)
-/model <alias>      Switch to the model matching the alias
-/model <name>       Switch to the model by its full name
+/model switch <alias>      Switch to the model matching the alias
+/model switch <name>       Switch to the model by its full name
+/model <alias>             Legacy syntax, still supported
 ```
 
 When `models` is configured, `/model` shows exactly that list without making an API round-trip. When omitted, models are fetched from the provider API or fall back to a built-in list.
@@ -456,6 +457,8 @@ cc-connect cron add --cron "0 6 * * *" --prompt "Summarize GitHub trending" --de
 cc-connect cron list
 cc-connect cron del <job-id>
 ```
+
+Optional: `--session-mode new-per-run` starts a fresh agent session on each run (default is `reuse`, same as before). `--timeout-mins N` sets how long the scheduler waits per run (`0` = no limit; omit = 30 minutes).
 
 ### Natural Language (Claude Code)
 

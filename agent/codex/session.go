@@ -54,7 +54,7 @@ func newCodexSession(ctx context.Context, workDir, model, effort, mode, resumeID
 	}
 	cs.alive.Store(true)
 
-	if resumeID != "" {
+	if resumeID != "" && resumeID != core.ContinueSession {
 		cs.threadID.Store(resumeID)
 	}
 
@@ -141,9 +141,11 @@ func (cs *codexSession) buildExecArgs(prompt string, imagePaths []string) []stri
 
 	var args []string
 	if isResume {
-		args = []string{"exec", "resume", "--json", "--skip-git-repo-check"}
+		// For resume: codex exec resume ... <thread_id> [--image ...] --json --cd <dir> <prompt>
+		// The codex CLI requires --json after the thread_id positional argument.
+		args = []string{"exec", "resume", "--skip-git-repo-check"}
 	} else {
-		args = []string{"exec", "--json", "--skip-git-repo-check"}
+		args = []string{"exec", "--skip-git-repo-check"}
 	}
 
 	switch cs.mode {
@@ -165,12 +167,13 @@ func (cs *codexSession) buildExecArgs(prompt string, imagePaths []string) []stri
 		for _, imagePath := range imagePaths {
 			args = append(args, "--image", imagePath)
 		}
-		args = append(args, prompt)
+		// codex exec resume does not support --cd; cmd.Dir handles cwd instead.
+		args = append(args, "--json", prompt)
 	} else {
 		for _, imagePath := range imagePaths {
 			args = append(args, "--image", imagePath)
 		}
-		args = append(args, "--cd", cs.workDir, prompt)
+		args = append(args, "--json", "--cd", cs.workDir, prompt)
 	}
 	return args
 }

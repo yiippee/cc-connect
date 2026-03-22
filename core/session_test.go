@@ -41,6 +41,23 @@ func TestSessionManager_NewSession(t *testing.T) {
 	}
 }
 
+func TestSessionManager_NewSideSession(t *testing.T) {
+	sm := NewSessionManager("")
+	main := sm.GetOrCreateActive("user1")
+	side := sm.NewSideSession("user1", "cron-job")
+
+	if side.ID == main.ID {
+		t.Fatal("side session should be a new record")
+	}
+	if sm.ActiveSessionID("user1") != main.ID {
+		t.Errorf("active session should stay main %q, got %q", main.ID, sm.ActiveSessionID("user1"))
+	}
+	list := sm.ListSessions("user1")
+	if len(list) != 2 {
+		t.Fatalf("want 2 sessions for user1, got %d", len(list))
+	}
+}
+
 func TestSessionManager_SwitchSession(t *testing.T) {
 	sm := NewSessionManager("")
 	s1 := sm.NewSession("user1", "first")
@@ -385,5 +402,17 @@ func TestSession_ConcurrentGetSet(t *testing.T) {
 	wg.Wait()
 	if got := s.GetAgentSessionID(); got != "id" {
 		t.Errorf("final GetAgentSessionID = %q, want %q", got, "id")
+	}
+}
+
+func TestSessionManager_StorePath(t *testing.T) {
+	sm := NewSessionManager("/var/data/sessions")
+	if got := sm.StorePath(); got != "/var/data/sessions" {
+		t.Errorf("StorePath() = %q, want %q", got, "/var/data/sessions")
+	}
+
+	sm2 := NewSessionManager("")
+	if got := sm2.StorePath(); got != "" {
+		t.Errorf("StorePath() empty = %q, want empty string", got)
 	}
 }
