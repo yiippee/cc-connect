@@ -475,16 +475,22 @@ const (
 	MsgBuiltinCmdShell     MsgKey = "shell"
 	MsgBuiltinCmdDir       MsgKey = "dir"
 
-	MsgDirChanged      MsgKey = "dir_changed"
-	MsgDirCurrent      MsgKey = "dir_current"
-	MsgDirUsage        MsgKey = "dir_usage"
-	MsgDirNotSupported MsgKey = "dir_not_supported"
-	MsgDirInvalidPath  MsgKey = "dir_invalid_path"
-	MsgDirHistoryTitle MsgKey = "dir_history_title"
-	MsgDirHistoryHint  MsgKey = "dir_history_hint"
-	MsgDirInvalidIndex MsgKey = "dir_invalid_index"
-	MsgDirNoHistory    MsgKey = "dir_no_history"
-	MsgDirNoPrevious   MsgKey = "dir_no_previous"
+	MsgDirChanged          MsgKey = "dir_changed"
+	MsgDirCurrent          MsgKey = "dir_current"
+	MsgDirReset            MsgKey = "dir_reset"
+	MsgDirUsage            MsgKey = "dir_usage"
+	MsgDirNotSupported     MsgKey = "dir_not_supported"
+	MsgDirInvalidPath      MsgKey = "dir_invalid_path"
+	MsgDirHistoryTitle     MsgKey = "dir_history_title"
+	MsgDirHistoryHint      MsgKey = "dir_history_hint"
+	MsgDirInvalidIndex     MsgKey = "dir_invalid_index"
+	MsgDirNoHistory        MsgKey = "dir_no_history"
+	MsgDirNoPrevious       MsgKey = "dir_no_previous"
+	MsgDirCardTitle        MsgKey = "dir_card_title"
+	MsgDirCardPageHint     MsgKey = "dir_card_page_hint"
+	MsgDirCardEmptyHistory MsgKey = "dir_card_empty_history"
+	MsgDirCardReset        MsgKey = "dir_card_reset"
+	MsgDirCardPrev         MsgKey = "dir_card_prev"
 
 	// Multi-workspace messages
 	MsgWsNotEnabled      MsgKey = "ws_not_enabled"
@@ -761,7 +767,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/compress\n  Compress conversation context\n\n" +
 			"/tts [always|voice_only]\n  View/switch text-to-speech mode\n\n" +
 			"/shell <command>\n  Run a shell command and return the output\n\n" +
-			"/dir [path]\n  Show or switch agent working directory\n\n" +
+			"/dir [path|reset]\n  Show, switch, or reset agent working directory\n\n" +
 			"/stop\n  Stop current execution\n\n" +
 			"/cron [add|list|del|enable|disable]\n  Manage scheduled tasks\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  Manage heartbeat\n\n" +
@@ -804,7 +810,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/compress\n  压缩会话上下文\n\n" +
 			"/tts [always|voice_only]\n  查看/切换语音合成模式\n\n" +
 			"/shell <命令>\n  执行 Shell 命令并返回结果\n\n" +
-			"/dir [路径]\n  查看或切换 Agent 工作目录\n\n" +
+			"/dir [路径|reset]\n  查看、切换或重置 Agent 工作目录\n\n" +
 			"/stop\n  停止当前执行\n\n" +
 			"/cron [add|list|del|enable|disable]\n  管理定时任务\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
@@ -847,7 +853,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/compress\n  壓縮會話上下文\n\n" +
 			"/tts [always|voice_only]\n  查看/切換語音合成模式\n\n" +
 			"/shell <命令>\n  執行 Shell 命令並返回結果\n\n" +
-			"/dir [路徑]\n  查看或切換 Agent 工作目錄\n\n" +
+			"/dir [路徑|reset]\n  查看、切換或重置 Agent 工作目錄\n\n" +
 			"/stop\n  停止當前執行\n\n" +
 			"/cron [add|list|del|enable|disable]\n  管理定時任務\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
@@ -889,7 +895,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/compress\n  会話コンテキストを圧縮\n\n" +
 			"/tts [always|voice_only]\n  音声合成モードの表示/切り替え\n\n" +
 			"/shell <コマンド>\n  シェルコマンドを実行して結果を返す\n\n" +
-			"/dir [パス]\n  エージェントの作業ディレクトリを表示/切り替え\n\n" +
+			"/dir [パス|reset]\n  エージェントの作業ディレクトリを表示/切り替え/リセット\n\n" +
 			"/stop\n  現在の実行を停止\n\n" +
 			"/cron [add|list|del|enable|disable]\n  スケジュールタスク管理\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  ハートビート管理\n\n" +
@@ -931,7 +937,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/compress\n  Comprimir contexto de conversación\n\n" +
 			"/tts [always|voice_only]\n  Ver/cambiar modo de síntesis de voz\n\n" +
 			"/shell <comando>\n  Ejecutar un comando shell y devolver la salida\n\n" +
-			"/dir [ruta]\n  Ver o cambiar el directorio de trabajo del agente\n\n" +
+			"/dir [ruta|reset]\n  Ver, cambiar o restablecer el directorio de trabajo del agente\n\n" +
 			"/stop\n  Detener ejecución actual\n\n" +
 			"/cron [add|list|del|enable|disable]\n  Gestionar tareas programadas\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  Gestionar heartbeat\n\n" +
@@ -1054,7 +1060,7 @@ var messages = map[MsgKey]map[Language]string{
 	MsgHelpToolsSection: {
 		LangEnglish: "**Tools & Automation**\n" +
 			"/shell <command> — Run a shell command\n" +
-			"/dir [path] — Show or switch work directory\n" +
+			"/dir [path|reset] — Show, switch, or reset work directory\n" +
 			"/cron [add|list|del|...] — Scheduled tasks\n" +
 			"/commands [add|del] — Custom commands\n" +
 			"/alias [add|del] — Command aliases\n" +
@@ -1063,7 +1069,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/stop — Stop current execution",
 		LangChinese: "**工具与自动化**\n" +
 			"/shell <命令> — 执行 Shell 命令\n" +
-			"/dir [路径] — 查看或切换工作目录\n" +
+			"/dir [路径|reset] — 查看、切换或重置工作目录\n" +
 			"/cron [add|list|del|...] — 定时任务\n" +
 			"/commands [add|del] — 自定义命令\n" +
 			"/alias [add|del] — 命令别名\n" +
@@ -1072,7 +1078,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/stop — 停止当前执行",
 		LangTraditionalChinese: "**工具與自動化**\n" +
 			"/shell <命令> — 執行 Shell 命令\n" +
-			"/dir [路徑] — 查看或切換工作目錄\n" +
+			"/dir [路徑|reset] — 查看、切換或重置工作目錄\n" +
 			"/cron [add|list|del|...] — 定時任務\n" +
 			"/commands [add|del] — 自訂命令\n" +
 			"/alias [add|del] — 命令別名\n" +
@@ -1081,7 +1087,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/stop — 停止當前執行",
 		LangJapanese: "**ツール・自動化**\n" +
 			"/shell <コマンド> — シェルコマンド実行\n" +
-			"/dir [パス] — 作業ディレクトリの表示/切り替え\n" +
+			"/dir [パス|reset] — 作業ディレクトリの表示/切り替え/リセット\n" +
 			"/cron [add|list|del|...] — スケジュールタスク\n" +
 			"/commands [add|del] — カスタムコマンド\n" +
 			"/alias [add|del] — コマンドエイリアス\n" +
@@ -1090,7 +1096,7 @@ var messages = map[MsgKey]map[Language]string{
 			"/stop — 現在の実行を停止",
 		LangSpanish: "**Herramientas y automatización**\n" +
 			"/shell <comando> — Ejecutar comando shell\n" +
-			"/dir [ruta] — Ver o cambiar directorio de trabajo\n" +
+			"/dir [ruta|reset] — Ver, cambiar o restablecer directorio de trabajo\n" +
 			"/cron [add|list|del|...] — Tareas programadas\n" +
 			"/commands [add|del] — Comandos personalizados\n" +
 			"/alias [add|del] — Alias de comandos\n" +
@@ -3143,11 +3149,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Ejecutar un comando shell, arg: <comando>",
 	},
 	MsgBuiltinCmdDir: {
-		LangEnglish:            "Show or switch agent working directory, arg: <path>",
-		LangChinese:            "查看或切换 Agent 工作目录，参数: <路径>",
-		LangTraditionalChinese: "查看或切換 Agent 工作目錄，參數: <路徑>",
-		LangJapanese:           "エージェントの作業ディレクトリを表示/変更、引数: <パス>",
-		LangSpanish:            "Ver o cambiar el directorio de trabajo del agente, arg: <ruta>",
+		LangEnglish:            "Show, switch, or reset agent working directory, arg: <path>",
+		LangChinese:            "查看、切换或重置 Agent 工作目录，参数: <路径>",
+		LangTraditionalChinese: "查看、切換或重置 Agent 工作目錄，參數: <路徑>",
+		LangJapanese:           "エージェントの作業ディレクトリを表示/変更/リセット、引数: <パス>",
+		LangSpanish:            "Ver, cambiar o restablecer el directorio de trabajo del agente, arg: <ruta>",
 	},
 	MsgDirChanged: {
 		LangEnglish:            "✅ Work directory changed to: `%s`\nThe next session will start in this directory.",
@@ -3163,12 +3169,19 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "📂 現在の作業ディレクトリ: `%s`",
 		LangSpanish:            "📂 Directorio de trabajo actual: `%s`",
 	},
+	MsgDirReset: {
+		LangEnglish:            "✅ Work directory reset to the configured default: `%s`",
+		LangChinese:            "✅ 工作目录已重置为配置的默认目录: `%s`",
+		LangTraditionalChinese: "✅ 工作目錄已重置為設定的預設目錄: `%s`",
+		LangJapanese:           "✅ 作業ディレクトリを設定済みのデフォルトに戻しました: `%s`",
+		LangSpanish:            "✅ El directorio de trabajo se restauró al valor predeterminado configurado: `%s`",
+	},
 	MsgDirUsage: {
-		LangEnglish:            "Usage: `/dir <path>`\nExample: `/dir ../project`",
-		LangChinese:            "用法: `/dir <路径>`\n示例: `/dir ../project`",
-		LangTraditionalChinese: "用法: `/dir <路徑>`\n範例: `/dir ../project`",
-		LangJapanese:           "使い方: `/dir <パス>`\n例: `/dir ../project`",
-		LangSpanish:            "Uso: `/dir <ruta>`\nEjemplo: `/dir ../project`",
+		LangEnglish:            "Usage: `/dir <path>`\n       `/dir reset`\nExample: `/dir ../project`",
+		LangChinese:            "用法: `/dir <路径>`\n      `/dir reset`\n示例: `/dir ../project`",
+		LangTraditionalChinese: "用法: `/dir <路徑>`\n      `/dir reset`\n範例: `/dir ../project`",
+		LangJapanese:           "使い方: `/dir <パス>`\n       `/dir reset`\n例: `/dir ../project`",
+		LangSpanish:            "Uso: `/dir <ruta>`\n      `/dir reset`\nEjemplo: `/dir ../project`",
 	},
 	MsgDirNotSupported: {
 		LangEnglish:            "This agent does not support dynamic work directory switching.",
@@ -3218,6 +3231,41 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 沒有上一個目錄記錄。",
 		LangJapanese:           "❌ 前のディレクトリが履歴にありません。",
 		LangSpanish:            "❌ No hay directorio anterior en el historial.",
+	},
+	MsgDirCardTitle: {
+		LangEnglish:            "Working directory",
+		LangChinese:            "工作目录",
+		LangTraditionalChinese: "工作目錄",
+		LangJapanese:           "作業ディレクトリ",
+		LangSpanish:            "Directorio de trabajo",
+	},
+	MsgDirCardPageHint: {
+		LangEnglish:            "Page %d/%d — use `/dir <page>` or the buttons below.",
+		LangChinese:            "第 %d/%d 页 — 可用 `/dir <页码>` 或下方按钮翻页。",
+		LangTraditionalChinese: "第 %d/%d 頁 — 可用 `/dir <頁碼>` 或下方按鈕翻頁。",
+		LangJapanese:           "%d/%d ページ — `/dir <ページ>` または下のボタンで移動。",
+		LangSpanish:            "Página %d/%d — usa `/dir <página>` o los botones.",
+	},
+	MsgDirCardEmptyHistory: {
+		LangEnglish:            "No directory history yet. Type `/dir <path>` to switch, or use **Reset** to restore the default.",
+		LangChinese:            "暂无目录历史。可发送 `/dir <路径>` 切换，或点 **重置** 恢复默认目录。",
+		LangTraditionalChinese: "暫無目錄歷史。可傳送 `/dir <路徑>` 切換，或點 **重置** 恢復預設目錄。",
+		LangJapanese:           "まだディレクトリ履歴がありません。`/dir <パス>` で切替えるか、**リセット** で既定に戻せます。",
+		LangSpanish:            "Aún no hay historial de directorios. Usa `/dir <ruta>` o **Restablecer** al valor por defecto.",
+	},
+	MsgDirCardReset: {
+		LangEnglish:            "Reset",
+		LangChinese:            "重置",
+		LangTraditionalChinese: "重置",
+		LangJapanese:           "リセット",
+		LangSpanish:            "Restablecer",
+	},
+	MsgDirCardPrev: {
+		LangEnglish:            "Previous",
+		LangChinese:            "上一目录",
+		LangTraditionalChinese: "上一目錄",
+		LangJapanese:           "前へ",
+		LangSpanish:            "Anterior",
 	},
 
 	// Multi-workspace messages

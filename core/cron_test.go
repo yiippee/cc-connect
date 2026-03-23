@@ -73,8 +73,12 @@ func TestCronStore_MutePersistence(t *testing.T) {
 		ID: "persist1", Project: "proj", SessionKey: "test:ch1",
 		CronExpr: "0 6 * * *", Prompt: "hello", Enabled: true, CreatedAt: time.Now(),
 	}
-	store.Add(job)
-	store.SetMute("persist1", true)
+	if err := store.Add(job); err != nil {
+		t.Fatal(err)
+	}
+	if !store.SetMute("persist1", true) {
+		t.Fatal("SetMute should return true")
+	}
 
 	store2, err := NewCronStore(dir)
 	if err != nil {
@@ -156,23 +160,27 @@ func TestRenderCronCard_WithButtons(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.Add(&CronJob{
+	if err := store.Add(&CronJob{
 		ID: "j1", Project: "test", SessionKey: "test:ch1",
 		CronExpr: "0 6 * * *", Prompt: "daily task", Enabled: true,
 		CreatedAt: time.Now(),
-	})
-	store.Add(&CronJob{
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(&CronJob{
 		ID: "j2", Project: "test", SessionKey: "test:ch1",
 		CronExpr: "0 12 * * *", Prompt: "noon task", Enabled: false, Mute: true,
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	scheduler := NewCronScheduler(store)
 	e.cronScheduler = scheduler
 
-	card := e.renderCronCard("test:ch1")
+	card := e.renderCronCard("test:ch1", "")
 	if card == nil {
 		t.Fatal("card should not be nil")
 	}
@@ -224,18 +232,20 @@ func TestRenderCronCard_HasHint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.Add(&CronJob{
+	if err := store.Add(&CronJob{
 		ID: "h1", Project: "test", SessionKey: "test:ch1",
 		CronExpr: "0 6 * * *", Prompt: "task", Enabled: true,
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	scheduler := NewCronScheduler(store)
 	e.cronScheduler = scheduler
 
-	card := e.renderCronCard("test:ch1")
+	card := e.renderCronCard("test:ch1", "")
 	text := card.RenderText()
 	if !strings.Contains(text, "/cron add") || !strings.Contains(text, "/cron mute") {
 		t.Errorf("card should contain command hints, got:\n%s", text)
@@ -249,18 +259,22 @@ func TestExecuteCardAction_CronActions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.Add(&CronJob{
+	if err := store.Add(&CronJob{
 		ID: "act1", Project: "test", SessionKey: "test:ch1",
 		CronExpr: "0 6 * * *", Prompt: "task", Enabled: true,
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	scheduler := NewCronScheduler(store)
 	e.cronScheduler = scheduler
 	scheduler.RegisterEngine("test", e)
-	scheduler.Start()
+	if err := scheduler.Start(); err != nil {
+		t.Fatal(err)
+	}
 	defer scheduler.Stop()
 
 	e.executeCardAction("/cron", "disable act1", "test:ch1")
@@ -300,11 +314,13 @@ func TestCmdCronMute_TextCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store.Add(&CronJob{
+	if err := store.Add(&CronJob{
 		ID: "txt1", Project: "test", SessionKey: "test:ch1",
 		CronExpr: "0 6 * * *", Prompt: "task", Enabled: true,
 		CreatedAt: time.Now(),
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)

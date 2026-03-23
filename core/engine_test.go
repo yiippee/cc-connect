@@ -82,6 +82,132 @@ func (p *stubPlatformEngine) clearSent() {
 	p.mu.Unlock()
 }
 
+type stubCronReplyTargetPlatform struct {
+	stubPlatformEngine
+	reconstructSessionKey string
+	resolvedSessionKey    string
+	resolveTitle          string
+}
+
+func (p *stubCronReplyTargetPlatform) ReconstructReplyCtx(sessionKey string) (any, error) {
+	p.reconstructSessionKey = sessionKey
+	return "base-rctx", nil
+}
+
+func (p *stubCronReplyTargetPlatform) ResolveCronReplyTarget(sessionKey string, title string) (string, any, error) {
+	p.resolvedSessionKey = sessionKey
+	p.resolveTitle = title
+	return "discord:thread-fresh", "fresh-rctx", nil
+}
+
+type resultAgent struct {
+	session AgentSession
+}
+
+func (a *resultAgent) Name() string { return "stub" }
+func (a *resultAgent) StartSession(_ context.Context, _ string) (AgentSession, error) {
+	return a.session, nil
+}
+func (a *resultAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) { return nil, nil }
+func (a *resultAgent) Stop() error                                                { return nil }
+
+type resultAgentSession struct {
+	events      chan Event
+	result      string
+	sendOnce    sync.Once
+	sentPrompts []string
+}
+
+func newResultAgentSession(result string) *resultAgentSession {
+	return &resultAgentSession{
+		events: make(chan Event, 1),
+		result: result,
+	}
+}
+
+func (s *resultAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.sentPrompts = append(s.sentPrompts, prompt)
+	s.sendOnce.Do(func() {
+		s.events <- Event{Type: EventResult, Content: s.result, Done: true}
+	})
+	return nil
+}
+
+func (s *resultAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }
+func (s *resultAgentSession) Events() <-chan Event                                 { return s.events }
+func (s *resultAgentSession) CurrentSessionID() string                             { return "result-session" }
+func (s *resultAgentSession) Alive() bool                                          { return true }
+func (s *resultAgentSession) Close() error                                         { return nil }
+
+type stubLifecyclePlatform struct {
+	stubPlatformEngine
+	handler         PlatformLifecycleHandler
+	registerCalls   int
+	cardNavSetCalls int
+	startCalls      int
+	stopCalls       int
+}
+
+func (p *stubLifecyclePlatform) Start(MessageHandler) error {
+	p.startCalls++
+	return nil
+}
+
+func (p *stubLifecyclePlatform) Stop() error {
+	p.stopCalls++
+	return nil
+}
+
+func (p *stubLifecyclePlatform) SetLifecycleHandler(h PlatformLifecycleHandler) {
+	p.handler = h
+}
+
+func (p *stubLifecyclePlatform) RegisterCommands([]BotCommandInfo) error {
+	p.registerCalls++
+	return nil
+}
+
+func (p *stubLifecyclePlatform) SetCardNavigationHandler(CardNavigationHandler) {
+	p.cardNavSetCalls++
+}
+
+type blockingRegisterPlatform struct {
+	stubLifecyclePlatform
+	registerStarted chan struct{}
+	allowRegister   chan struct{}
+	stopCalled      chan struct{}
+	registerOnce    sync.Once
+	stopOnce        sync.Once
+}
+
+func newBlockingRegisterPlatform(name string) *blockingRegisterPlatform {
+	return &blockingRegisterPlatform{
+		stubLifecyclePlatform: stubLifecyclePlatform{
+			stubPlatformEngine: stubPlatformEngine{n: name},
+		},
+		registerStarted: make(chan struct{}),
+		allowRegister:   make(chan struct{}),
+		stopCalled:      make(chan struct{}),
+	}
+}
+
+func (p *blockingRegisterPlatform) RegisterCommands([]BotCommandInfo) error {
+	p.registerOnce.Do(func() {
+		close(p.registerStarted)
+	})
+	<-p.allowRegister
+	p.registerCalls++
+	return nil
+}
+
+func (p *blockingRegisterPlatform) Stop() error {
+	p.stopCalls++
+	p.stopOnce.Do(func() {
+		close(p.stopCalled)
+	})
+	return nil
+}
+
 type stubMediaPlatform struct {
 	stubPlatformEngine
 	images []ImageAttachment
@@ -387,6 +513,141 @@ func TestEngineSendToSessionWithAttachments_DisabledByConfig(t *testing.T) {
 	}
 }
 
+func TestEngineStart_DefersAsyncPlatformReadyInitialization(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("help", "help", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if p.handler == nil {
+		t.Fatal("lifecycle handler not installed")
+	}
+	if p.registerCalls != 0 {
+		t.Fatalf("registerCalls = %d, want 0 before ready", p.registerCalls)
+	}
+	if p.cardNavSetCalls != 0 {
+		t.Fatalf("cardNavSetCalls = %d, want 0 before ready", p.cardNavSetCalls)
+	}
+}
+
+func TestEngine_OnPlatformReady_IsIdempotentUntilUnavailable(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("help", "help", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	e.OnPlatformReady(p)
+	e.OnPlatformReady(p)
+
+	if p.registerCalls != 1 {
+		t.Fatalf("registerCalls = %d, want 1", p.registerCalls)
+	}
+	if p.cardNavSetCalls != 1 {
+		t.Fatalf("cardNavSetCalls = %d, want 1", p.cardNavSetCalls)
+	}
+
+	e.OnPlatformUnavailable(p, errors.New("lost"))
+	e.OnPlatformReady(p)
+
+	if p.registerCalls != 2 {
+		t.Fatalf("registerCalls after recover = %d, want 2", p.registerCalls)
+	}
+}
+
+func TestEngine_OnPlatformUnavailable_IsIdempotent(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("help", "help", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	e.OnPlatformReady(p)
+	e.OnPlatformUnavailable(p, errors.New("lost"))
+	e.OnPlatformUnavailable(p, errors.New("lost-again"))
+	e.OnPlatformReady(p)
+
+	if p.registerCalls != 2 {
+		t.Fatalf("registerCalls after duplicate unavailable = %d, want 2", p.registerCalls)
+	}
+}
+
+func TestEngine_LifecycleCallbacksIgnoredAfterStopBegins(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("help", "help", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := e.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	e.OnPlatformReady(p)
+	e.OnPlatformUnavailable(p, errors.New("late"))
+
+	if p.registerCalls != 0 {
+		t.Fatalf("registerCalls = %d, want 0 after stop", p.registerCalls)
+	}
+}
+
+func TestEngine_StopDoesNotWaitForBlockedPlatformCapabilityInit(t *testing.T) {
+	p := newBlockingRegisterPlatform("telegram")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("help", "help", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	readyDone := make(chan struct{})
+	go func() {
+		e.OnPlatformReady(p)
+		close(readyDone)
+	}()
+
+	select {
+	case <-p.registerStarted:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("RegisterCommands was not called")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- e.Stop()
+	}()
+
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Stop blocked on platform capability initialization")
+	}
+
+	select {
+	case <-p.stopCalled:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("platform Stop was not called while RegisterCommands was blocked")
+	}
+
+	close(p.allowRegister)
+
+	select {
+	case <-readyDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("OnPlatformReady did not finish after RegisterCommands was released")
+	}
+}
+
 func TestProcessInteractiveEvents_SuppressesDuplicateSideChannelText(t *testing.T) {
 	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -447,6 +708,44 @@ func TestProcessInteractiveEvents_DoesNotSuppressDifferentFinalText(t *testing.T
 	}
 	if got := p.getSent()[1]; got != finalText {
 		t.Fatalf("final sent text = %q, want %q", got, finalText)
+	}
+}
+
+func TestProcessInteractiveEvents_QuietToolTurnKeepsPreviewOnFinalize(t *testing.T) {
+	p := &mockKeepPreviewPlatform{}
+	p.n = "feishu"
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+		quiet:        true,
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "final response"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil)
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no plain-text fallback sends", got)
+	}
+
+	p.mu.Lock()
+	deletedCount := len(p.deleted)
+	previewMsgs := append([]string(nil), p.messages...)
+	p.mu.Unlock()
+
+	if deletedCount != 0 {
+		t.Fatalf("deleted previews = %d, want 0", deletedCount)
+	}
+	if len(previewMsgs) == 0 || previewMsgs[len(previewMsgs)-1] != "update:final response" {
+		t.Fatalf("preview messages = %#v, want in-place final update", previewMsgs)
 	}
 }
 
@@ -2153,6 +2452,75 @@ func TestCmdDir_HelpShowsUsage(t *testing.T) {
 	}
 }
 
+func TestCmdDir_PersistsAbsoluteOverride(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	baseDir := t.TempDir()
+	nextDir := filepath.Join(baseDir, "next")
+	if err := os.Mkdir(nextDir, 0o755); err != nil {
+		t.Fatalf("mkdir next dir: %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), "projects", "test.state.json")
+	store := NewProjectStateStore(statePath)
+
+	agent := &stubWorkDirAgent{workDir: baseDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBaseWorkDir(baseDir)
+	e.SetProjectStateStore(store)
+
+	e.cmdDir(p, &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}, []string{"next"})
+
+	reloaded := NewProjectStateStore(statePath)
+	if got := reloaded.WorkDirOverride(); got != nextDir {
+		t.Fatalf("WorkDirOverride() = %q, want %q", got, nextDir)
+	}
+}
+
+func TestCmdDir_ResetRestoresBaseWorkDirAndClearsState(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	baseDir := t.TempDir()
+	overrideDir := filepath.Join(baseDir, "override")
+	if err := os.Mkdir(overrideDir, 0o755); err != nil {
+		t.Fatalf("mkdir override dir: %v", err)
+	}
+	statePath := filepath.Join(t.TempDir(), "projects", "test.state.json")
+	store := NewProjectStateStore(statePath)
+	store.SetWorkDirOverride(overrideDir)
+	store.Save()
+
+	agent := &stubWorkDirAgent{workDir: overrideDir}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBaseWorkDir(baseDir)
+	e.SetProjectStateStore(store)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("existing-session", "test")
+	s.Name = "old"
+	s.AddHistory("user", "hello")
+
+	e.cmdDir(p, msg, []string{"reset"})
+
+	if agent.workDir != baseDir {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, baseDir)
+	}
+	reloaded := NewProjectStateStore(statePath)
+	if got := reloaded.WorkDirOverride(); got != "" {
+		t.Fatalf("WorkDirOverride() = %q, want empty", got)
+	}
+	if s.GetAgentSessionID() != "" {
+		t.Fatalf("AgentSessionID = %q, want cleared", s.GetAgentSessionID())
+	}
+	if s.Name != "old" {
+		t.Fatalf("Name = %q, want unchanged", s.Name)
+	}
+	if len(s.History) != 0 {
+		t.Fatalf("history length = %d, want 0", len(s.History))
+	}
+	if len(p.sent) != 1 || !strings.Contains(strings.ToLower(p.sent[0]), "default") {
+		t.Fatalf("sent = %v, want reset success message", p.sent)
+	}
+}
+
 func TestCmdDir_SwitchesByHistoryIndex(t *testing.T) {
 	p := &stubPlatformEngine{n: "plain"}
 	tempDir := t.TempDir()
@@ -2640,6 +3008,60 @@ func TestRenderListCard_MakesEveryVisibleSessionClickable(t *testing.T) {
 	}
 	if btn.Type != "primary" {
 		t.Fatalf("active session button type = %q, want primary", btn.Type)
+	}
+}
+
+func TestRenderDirCard_HistoryRowsUseSelectActions(t *testing.T) {
+	tempDir := t.TempDir()
+	dir1 := filepath.Join(tempDir, "dir1")
+	dir2 := filepath.Join(tempDir, "dir2")
+	for _, d := range []string{dir1, dir2} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	dataDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: dir2}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, dataDir, LangEnglish)
+	e.SetDirHistory(NewDirHistory(dataDir))
+	e.dirHistory.Add("test", dir1)
+	e.dirHistory.Add("test", dir2)
+
+	card, err := e.renderDirCard("test:user1", 1)
+	if err != nil {
+		t.Fatalf("renderDirCard: %v", err)
+	}
+	if got := countCardActionValues(card, "act:/dir select "); got != 2 {
+		t.Fatalf("dir select actions = %d, want 2", got)
+	}
+}
+
+func TestHandleCardNav_DirSelectSwitchesWorkDir(t *testing.T) {
+	temp := t.TempDir()
+	d1 := filepath.Join(temp, "a")
+	d2 := filepath.Join(temp, "b")
+	d3 := filepath.Join(temp, "c")
+	for _, d := range []string{d1, d2, d3} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	dataDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: d3}
+	e := NewEngine("test", agent, []Platform{&stubPlatformEngine{n: "test"}}, dataDir, LangEnglish)
+	e.SetDirHistory(NewDirHistory(dataDir))
+	e.dirHistory.Add("test", d1)
+	e.dirHistory.Add("test", d2)
+	e.dirHistory.Add("test", d3)
+
+	sk := "test:user1"
+	_ = e.handleCardNav("act:/dir select 2", sk)
+	if agent.workDir != d2 {
+		t.Fatalf("workDir = %q, want %q", agent.workDir, d2)
+	}
+	card := e.handleCardNav("nav:/dir 1", sk)
+	if card == nil {
+		t.Fatal("expected dir card after nav")
 	}
 }
 
@@ -3137,7 +3559,7 @@ func TestFirstContinueBridge_SyntheticDoesNotConsume(t *testing.T) {
 		t.Fatal("TryLock")
 	}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", sess, e.sessions, nil, "", false)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", sess, e.sessions, nil, "", false, nil)
 	if got := ag.startArgs(); len(got) != 1 || got[0] != "" {
 		t.Fatalf("synthetic start ids = %#v want [\"\"]", got)
 	}
@@ -3147,7 +3569,7 @@ func TestFirstContinueBridge_SyntheticDoesNotConsume(t *testing.T) {
 
 	e.cleanupInteractiveState(key)
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", sess, e.sessions, nil, "", true)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", sess, e.sessions, nil, "", true, nil)
 	got := ag.startArgs()
 	if len(got) != 2 {
 		t.Fatalf("want 2 StartSession calls, got %#v", got)
@@ -3257,7 +3679,7 @@ func TestSessionMismatch_RecyclesStaleAgent(t *testing.T) {
 	// The active Session now wants a DIFFERENT agent session ID.
 	session := &Session{AgentSessionID: "new-agent-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true, nil)
 
 	if state.agentSession == oldSess {
 		t.Fatal("expected stale agent session to be replaced")
@@ -3296,7 +3718,7 @@ func TestSessionMismatch_DoesNotLeakQuiet(t *testing.T) {
 	// Active session wants "new-id", which mismatches "old-id".
 	session := &Session{AgentSessionID: "new-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true, nil)
 
 	state.mu.Lock()
 	q := state.quiet
@@ -3327,7 +3749,7 @@ func TestSessionMismatch_ReusesWhenIDsMatch(t *testing.T) {
 
 	session := &Session{AgentSessionID: "matching-id"}
 
-	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true)
+	state := e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true, nil)
 	if state != existingState {
 		t.Fatal("expected existing state to be reused when session IDs match")
 	}
@@ -3345,7 +3767,7 @@ func TestSessionIDWriteback_ImmediateAfterStartSession(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: ""} // empty — no prior binding
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true, nil)
 
 	got := session.GetAgentSessionID()
 
@@ -3365,7 +3787,7 @@ func TestSessionIDWriteback_DoesNotOverwriteExisting(t *testing.T) {
 	key := "test:user1"
 	session := &Session{AgentSessionID: "existing-uuid"}
 
-	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true)
+	e.getOrCreateInteractiveStateWith(key, p, "ctx", session, e.sessions, nil, "", true, nil)
 
 	got := session.GetAgentSessionID()
 
@@ -3401,7 +3823,7 @@ func TestStaleGoroutineCleanup_RaceSimulation(t *testing.T) {
 
 	// Step 3: New turn creates Session B and calls getOrCreateInteractiveStateWith.
 	sessionB := &Session{AgentSessionID: ""}
-	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "", true)
+	newState := e.getOrCreateInteractiveStateWith(key, p, "ctx", sessionB, e.sessions, nil, "", true, nil)
 
 	// Verify S2 is in the map.
 	e.interactiveMu.Lock()
@@ -3676,6 +4098,136 @@ func TestCmdBindSetup_UsesSharedLogic(t *testing.T) {
 	content, _ := os.ReadFile(memFile)
 	if !strings.Contains(string(content), ccConnectInstructionMarker) {
 		t.Error("expected instructions written to file")
+	}
+}
+
+// --- session resilience tests ---
+
+// stubStartSessionAgent records StartSession calls and can fail on specific session IDs.
+type stubStartSessionAgent struct {
+	calls   []string
+	failIDs map[string]error // session IDs that should fail
+	mu      sync.Mutex
+}
+
+func (a *stubStartSessionAgent) Name() string { return "stub" }
+func (a *stubStartSessionAgent) StartSession(_ context.Context, sessionID string) (AgentSession, error) {
+	a.mu.Lock()
+	a.calls = append(a.calls, sessionID)
+	a.mu.Unlock()
+
+	if err, ok := a.failIDs[sessionID]; ok {
+		return nil, err
+	}
+	return &stubAgentSession{}, nil
+}
+func (a *stubStartSessionAgent) ListSessions(_ context.Context) ([]AgentSessionInfo, error) {
+	return nil, nil
+}
+func (a *stubStartSessionAgent) Stop() error { return nil }
+
+func TestResumeFailureFallbackToFreshSession(t *testing.T) {
+	agent := &stubStartSessionAgent{
+		failIDs: map[string]error{
+			ContinueSession: fmt.Errorf("Prompt is too long"),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &Engine{
+		agent:             agent,
+		sessions:          NewSessionManager(""),
+		ctx:               ctx,
+		i18n:              NewI18n("en"),
+		interactiveStates: make(map[string]*interactiveState),
+		display:           DisplayCfg{},
+	}
+
+	session := e.sessions.GetOrCreateActive("test:user1")
+	session.SetAgentSessionID("old-session-id", "stub")
+
+	p := &stubPlatformEngine{n: "test"}
+	state := e.getOrCreateInteractiveStateWith("test:user1", p, "ctx", session, e.sessions, nil, "", true, nil)
+
+	if state.agentSession == nil {
+		t.Fatal("expected agentSession to be non-nil after fallback")
+	}
+
+	agent.mu.Lock()
+	calls := append([]string{}, agent.calls...)
+	agent.mu.Unlock()
+
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 StartSession calls, got %d: %v", len(calls), calls)
+	}
+	// First call should be ContinueSession (first connection uses --continue)
+	if calls[0] != ContinueSession {
+		t.Fatalf("first StartSession call = %q, want %q", calls[0], ContinueSession)
+	}
+	// Second call should be empty string (fresh session fallback)
+	if calls[1] != "" {
+		t.Fatalf("second StartSession call = %q, want empty string", calls[1])
+	}
+}
+
+func TestFreshSessionRespectedAfterFirstConnection(t *testing.T) {
+	agent := &stubStartSessionAgent{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e := &Engine{
+		agent:             agent,
+		sessions:          NewSessionManager(""),
+		ctx:               ctx,
+		i18n:              NewI18n("en"),
+		interactiveStates: make(map[string]*interactiveState),
+		display:           DisplayCfg{},
+	}
+	// Simulate first connection already happened
+	e.hasConnectedOnce.Store(true)
+
+	// Create a session with no saved agent session ID (fresh session via /new)
+	session := e.sessions.GetOrCreateActive("test:user2")
+
+	p := &stubPlatformEngine{n: "test"}
+	state := e.getOrCreateInteractiveStateWith("test:user2", p, "ctx", session, e.sessions, nil, "", true, nil)
+
+	if state.agentSession == nil {
+		t.Fatal("expected agentSession to be non-nil")
+	}
+
+	agent.mu.Lock()
+	calls := append([]string{}, agent.calls...)
+	agent.mu.Unlock()
+
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 StartSession call, got %d: %v", len(calls), calls)
+	}
+	// Should be empty string (fresh session), NOT ContinueSession
+	if calls[0] != "" {
+		t.Fatalf("StartSession call = %q, want empty string (fresh session)", calls[0])
+	}
+}
+
+func TestParseSelfReportedCtx(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{"here is my response\n[ctx: ~42%]", 42},
+		{"no context here", 0},
+		{"response\n[ctx: ~100%]", 100},
+		{"response\n[ctx: ~5%]", 5},
+		{"", 0},
+	}
+	for _, tt := range tests {
+		got := parseSelfReportedCtx(tt.input)
+		if got != tt.want {
+			t.Errorf("parseSelfReportedCtx(%q) = %d, want %d", tt.input, got, tt.want)
+		}
 	}
 }
 
@@ -5942,6 +6494,74 @@ func TestEngine_AddPlatform_Multiple(t *testing.T) {
 
 	if len(e.platforms) != 3 {
 		t.Fatalf("expected 3 platforms, got %d", len(e.platforms))
+	}
+}
+
+func TestExecuteCronJob_ResolvesCronReplyTarget(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewCronStore(dir)
+	if err != nil {
+		t.Fatalf("NewCronStore() error = %v", err)
+	}
+	scheduler := NewCronScheduler(store)
+
+	platform := &stubCronReplyTargetPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "discord"},
+	}
+	agentSession := newResultAgentSession("cron complete")
+	agent := &resultAgent{session: agentSession}
+
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+	e.cronScheduler = scheduler
+
+	job := &CronJob{
+		ID:          "job-1",
+		SessionKey:  "discord:channel-1:user-1",
+		Prompt:      "summarize activity",
+		Description: "Daily summary",
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatalf("store.Add() error = %v", err)
+	}
+
+	if err := e.ExecuteCronJob(job); err != nil {
+		t.Fatalf("ExecuteCronJob() error = %v", err)
+	}
+	if platform.resolvedSessionKey != "discord:channel-1:user-1" {
+		t.Fatalf("ResolveCronReplyTarget sessionKey = %q, want base session key", platform.resolvedSessionKey)
+	}
+	if platform.resolveTitle != "Daily summary" {
+		t.Fatalf("ResolveCronReplyTarget title = %q, want Daily summary", platform.resolveTitle)
+	}
+
+	sent := platform.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("sent messages = %d, want 2", len(sent))
+	}
+	if sent[0] != "⏰ Daily summary" {
+		t.Fatalf("sent[0] = %q, want cron start notice", sent[0])
+	}
+	if sent[1] != "cron complete" {
+		t.Fatalf("sent[1] = %q, want final result", sent[1])
+	}
+
+	if got := len(e.sessions.ListSessions("discord:thread-fresh")); got != 0 {
+		t.Fatalf("fresh session count = %d, want 0 for reuse mode", got)
+	}
+	if got := len(e.sessions.ListSessions("discord:channel-1:user-1")); got != 1 {
+		t.Fatalf("base session count = %d, want 1", got)
+	}
+	if job.SessionKey != "discord:channel-1:user-1" {
+		t.Fatalf("job.SessionKey = %q, want unchanged base session key", job.SessionKey)
+	}
+	stored := store.Get("job-1")
+	if stored == nil || stored.SessionKey != "discord:channel-1:user-1" {
+		t.Fatalf("stored sessionKey = %#v, want unchanged base session key", stored)
+	}
+
+	if len(agentSession.sentPrompts) != 1 || !strings.Contains(agentSession.sentPrompts[0], "summarize activity") {
+		t.Fatalf("agent prompts = %#v, want prompt containing summarize activity", agentSession.sentPrompts)
 	}
 }
 

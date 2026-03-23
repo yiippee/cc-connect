@@ -24,6 +24,17 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// CronReplyTargetResolver is an optional interface for platforms that need to
+// map a logical cron session key to the actual reply target used at execution
+// time. This is useful for platforms where proactive replies may need to create
+// or switch to a thread before the cron run starts.
+//
+// Implementations that do not need special handling should return
+// ErrNotSupported so callers can fall back to ReconstructReplyCtx(sessionKey).
+type CronReplyTargetResolver interface {
+	ResolveCronReplyTarget(sessionKey string, title string) (resolvedSessionKey string, replyCtx any, err error)
+}
+
 // SessionEnvInjector is an optional interface for agents that accept
 // per-session environment variables (e.g. CC_PROJECT, CC_SESSION_KEY).
 type SessionEnvInjector interface {
@@ -160,6 +171,27 @@ type CardNavigationHandler func(action string, sessionKey string) *Card
 // card navigation (updating the existing card instead of sending a new message).
 type CardNavigable interface {
 	SetCardNavigationHandler(h CardNavigationHandler)
+}
+
+// PlatformLifecycleHandler receives readiness state transitions from async
+// recoverable platforms.
+type PlatformLifecycleHandler interface {
+	OnPlatformReady(p Platform)
+	OnPlatformUnavailable(p Platform, err error)
+}
+
+// AsyncRecoverablePlatform is an optional interface for platforms that start
+// a background recovery loop and later report readiness or unavailability.
+//
+// Platforms implementing this interface may return from Start() before they are
+// actually ready to receive traffic. Callers must treat OnPlatformReady as the
+// signal that deferred platform capabilities may be initialized and the
+// platform is usable. A nil Start() return therefore means the recovery loop
+// was launched successfully, not necessarily that an initial connection was
+// established.
+type AsyncRecoverablePlatform interface {
+	Platform
+	SetLifecycleHandler(h PlatformLifecycleHandler)
 }
 
 // MessageHandler is called by platforms when a new message arrives.

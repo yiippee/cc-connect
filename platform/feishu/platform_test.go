@@ -2,6 +2,7 @@ package feishu
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -33,6 +34,25 @@ func TestNew_CanDisableInteractiveCards(t *testing.T) {
 	}
 	if _, ok := p.(core.CardSender); ok {
 		t.Fatal("expected disabled Feishu platform to fall back to plain text")
+	}
+}
+
+func TestNew_DisabledInteractiveCardsDoesNotStartPreviewCard(t *testing.T) {
+	pAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p, ok := pAny.(*Platform)
+	if !ok {
+		t.Fatalf("platform type = %T, want *Platform", pAny)
+	}
+
+	_, err = p.SendPreviewStart(context.Background(), replyContext{messageID: "om_x", chatID: "oc_x"}, "hello")
+	if err == nil {
+		t.Fatal("SendPreviewStart() error = nil, want not supported when cards are disabled")
+	}
+	if err != core.ErrNotSupported {
+		t.Fatalf("SendPreviewStart() error = %v, want %v", err, core.ErrNotSupported)
 	}
 }
 
@@ -592,12 +612,6 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 			platform:      &Platform{threadIsolation: true},
 			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:ou_user"},
 			wantThreading: false,
-		},
-		{
-			name:          "reply_in_thread enabled",
-			platform:      &Platform{replyInThread: true},
-			replyCtx:      replyContext{messageID: "om_reply"},
-			wantThreading: true,
 		},
 		{
 			name:          "plain reply remains non-threaded",

@@ -39,20 +39,21 @@ type interactionReplyCtx struct {
 }
 
 type Platform struct {
-	token                 string
-	allowFrom             string
-	guildID               string // optional: per-guild registration (instant) vs global (up to 1h propagation)
-	groupReplyAll         bool
-	shareSessionInChannel bool
-	threadIsolation       bool
-	session               *discordgo.Session
-	handler               core.MessageHandler
-	botID                 string
-	appID                 string
-	channelNameCache      sync.Map // channelID -> name
-	botRoleIDs            sync.Map // guildID -> bot managed role ID
-	readyCh               chan struct{}
-	seenMsgs              sync.Map // message ID dedup: prevents duplicate MessageCreate events
+	token                      string
+	allowFrom                  string
+	guildID                    string // optional: per-guild registration (instant) vs global (up to 1h propagation)
+	groupReplyAll              bool
+	shareSessionInChannel      bool
+	threadIsolation            bool
+	respondToAtEveryoneAndHere bool
+	session                    *discordgo.Session
+	handler                    core.MessageHandler
+	botID                      string
+	appID                      string
+	channelNameCache           sync.Map // channelID -> name
+	botRoleIDs                 sync.Map // guildID -> bot managed role ID
+	readyCh                    chan struct{}
+	seenMsgs                   sync.Map // message ID dedup: prevents duplicate MessageCreate events
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -66,14 +67,16 @@ func New(opts map[string]any) (core.Platform, error) {
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	return &Platform{
-		token:                 token,
-		allowFrom:             allowFrom,
-		guildID:               guildID,
-		groupReplyAll:         groupReplyAll,
-		shareSessionInChannel: shareSessionInChannel,
-		readyCh:               make(chan struct{}),
-		threadIsolation:       threadIsolation,
+		token:                      token,
+		allowFrom:                  allowFrom,
+		guildID:                    guildID,
+		groupReplyAll:              groupReplyAll,
+		shareSessionInChannel:      shareSessionInChannel,
+		readyCh:                    make(chan struct{}),
+		threadIsolation:            threadIsolation,
+		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 	}, nil
 }
 
@@ -109,6 +112,7 @@ func (rc replyContext) useThreadChannel() bool {
 type discordThreadOps interface {
 	ResolveChannel(channelID string) (*discordgo.Channel, error)
 	StartThread(channelID, messageID, name string, archiveDuration int) (*discordgo.Channel, error)
+	StartStandaloneThread(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error)
 	JoinThread(threadID string) error
 }
 
@@ -131,6 +135,13 @@ func (o sessionThreadOps) StartThread(channelID, messageID, name string, archive
 		return nil, fmt.Errorf("discord: session not initialized")
 	}
 	return o.session.MessageThreadStart(channelID, messageID, name, archiveDuration)
+}
+
+func (o sessionThreadOps) StartStandaloneThread(channelID, name string, typ discordgo.ChannelType, archiveDuration int) (*discordgo.Channel, error) {
+	if o.session == nil {
+		return nil, fmt.Errorf("discord: session not initialized")
+	}
+	return o.session.ThreadStart(channelID, name, typ, archiveDuration)
 }
 
 func (o sessionThreadOps) JoinThread(threadID string) error {
@@ -169,6 +180,33 @@ func threadNameForMessage(m *discordgo.MessageCreate, botID string) string {
 		name = "cc session"
 	}
 	return truncateDiscordThreadName(name, 90)
+}
+
+func freshThreadName(title string) string {
+	name := strings.Join(strings.Fields(strings.ReplaceAll(title, "\n", " ")), " ")
+	if name == "" {
+		name = "cc cron"
+	}
+	return truncateDiscordThreadName(name, 90)
+}
+
+func standaloneThreadType(parentType discordgo.ChannelType) (discordgo.ChannelType, bool) {
+	switch parentType {
+	case discordgo.ChannelTypeGuildText:
+		return discordgo.ChannelTypeGuildPublicThread, true
+	case discordgo.ChannelTypeGuildNews:
+		return discordgo.ChannelTypeGuildNewsThread, true
+	default:
+		return 0, false
+	}
+}
+
+func parseDiscordSessionKeyChannelID(sessionKey string) (string, error) {
+	parts := strings.SplitN(sessionKey, ":", 3)
+	if len(parts) < 2 || parts[0] != "discord" || parts[1] == "" {
+		return "", fmt.Errorf("discord: invalid session key %q", sessionKey)
+	}
+	return parts[1], nil
 }
 
 func resolveSessionKeyForChannel(channelID, userID string, shareSessionInChannel bool, threadIsolation bool, ops discordThreadOps) string {
@@ -223,6 +261,47 @@ func resolveThreadReplyContext(m *discordgo.MessageCreate, botID string, ops dis
 		slog.Debug("discord: join new thread failed", "thread", thread.ID, "error", err)
 	}
 	rc := replyContext{channelID: thread.ID, messageID: m.ID, threadID: thread.ID}
+	return buildThreadSessionKey(thread.ID), rc, nil
+}
+
+func resolveCronReplyTarget(sessionKey, title string, ops discordThreadOps) (string, replyContext, error) {
+	channelID, err := parseDiscordSessionKeyChannelID(sessionKey)
+	if err != nil {
+		return "", replyContext{}, err
+	}
+
+	ch, err := ops.ResolveChannel(channelID)
+	if err != nil {
+		return "", replyContext{}, fmt.Errorf("resolve channel %s: %w", channelID, err)
+	}
+	parentChannelID := channelID
+	parentType := ch.Type
+	if isThreadChannelType(ch.Type) {
+		if ch.ParentID == "" {
+			return "", replyContext{}, core.ErrNotSupported
+		}
+		parent, err := ops.ResolveChannel(ch.ParentID)
+		if err != nil {
+			return "", replyContext{}, fmt.Errorf("resolve parent channel %s: %w", ch.ParentID, err)
+		}
+		parentChannelID = ch.ParentID
+		parentType = parent.Type
+	}
+
+	threadType, ok := standaloneThreadType(parentType)
+	if !ok {
+		return "", replyContext{}, core.ErrNotSupported
+	}
+
+	thread, err := ops.StartStandaloneThread(parentChannelID, freshThreadName(title), threadType, 1440)
+	if err != nil {
+		return "", replyContext{}, fmt.Errorf("start thread in channel %s: %w", parentChannelID, err)
+	}
+	if err := ops.JoinThread(thread.ID); err != nil {
+		slog.Debug("discord: join fresh thread failed", "thread", thread.ID, "error", err)
+	}
+
+	rc := replyContext{channelID: thread.ID, threadID: thread.ID}
 	return buildThreadSessionKey(thread.ID), rc, nil
 }
 
@@ -355,11 +434,14 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			botRoleID = p.botRoleIDForGuild(m.GuildID)
 		}
 		if m.GuildID != "" && !p.groupReplyAll {
-			if !isDiscordBotMention(m, p.botID, botRoleID) {
+			if !isDiscordBotMention(m, p.botID, botRoleID, p.respondToAtEveryoneAndHere) {
 				slog.Debug("discord: ignoring guild message without bot mention", "channel", m.ChannelID)
 				return
 			}
 			m.Content = stripDiscordMentionWithRole(m.Content, p.botID, botRoleID)
+			if m.MentionEveryone {
+				m.Content = stripEveryoneHere(m.Content)
+			}
 		}
 
 		slog.Debug("discord: message received", "user", m.Author.Username, "channel", m.ChannelID)
@@ -414,7 +496,7 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			MessageID: m.ID,
 			UserID:    m.Author.ID, UserName: m.Author.Username,
 			ChatName: p.resolveChannelName(m.ChannelID),
-			Content: m.Content, Images: images, Audio: audio, ReplyCtx: rctx,
+			Content:  m.Content, Images: images, Audio: audio, ReplyCtx: rctx,
 		}
 		p.handler(p, msg)
 	})
@@ -481,7 +563,7 @@ func (p *Platform) handleInteraction(s *discordgo.Session, i *discordgo.Interact
 		MessageID: i.ID,
 		UserID:    userID, UserName: userName,
 		ChatName: p.resolveChannelName(channelID),
-		Content: cmdText, ReplyCtx: ictx,
+		Content:  cmdText, ReplyCtx: ictx,
 	}
 	p.handler(p, msg)
 }
@@ -659,6 +741,17 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	return rc, nil
 }
 
+func (p *Platform) ResolveCronReplyTarget(sessionKey string, title string) (string, any, error) {
+	if !p.threadIsolation {
+		return "", nil, core.ErrNotSupported
+	}
+	resolvedSessionKey, rc, err := resolveCronReplyTarget(sessionKey, title, sessionThreadOps{session: p.session})
+	if err != nil {
+		return "", nil, err
+	}
+	return resolvedSessionKey, rc, nil
+}
+
 // discordPreviewHandle stores the IDs needed to edit or delete a preview message.
 type discordPreviewHandle struct {
 	channelID string
@@ -796,8 +889,18 @@ func stripDiscordMentionWithRole(text, botID string, botRoleID string) string {
 	return strings.TrimSpace(text)
 }
 
+// stripEveryoneHere removes @everyone and @here from text.
+func stripEveryoneHere(text string) string {
+	text = strings.ReplaceAll(text, "@everyone", "")
+	text = strings.ReplaceAll(text, "@here", "")
+	return strings.TrimSpace(text)
+}
+
 // isDiscordBotMention checks if the message mentions the bot by user ID or managed role ID.
-func isDiscordBotMention(m *discordgo.MessageCreate, botID string, botRoleID string) bool {
+func isDiscordBotMention(m *discordgo.MessageCreate, botID string, botRoleID string, respondToAtEveryoneAndHere bool) bool {
+	if respondToAtEveryoneAndHere && m.MentionEveryone {
+		return true
+	}
 	for _, u := range m.Mentions {
 		if u != nil && u.ID == botID {
 			return true
@@ -888,4 +991,3 @@ func downloadURL(u string) ([]byte, error) {
 	}
 	return io.ReadAll(resp.Body)
 }
-

@@ -8,7 +8,9 @@ Complete guide to using cc-connect features.
 - [Permission Modes](#permission-modes)
 - [API Provider Management](#api-provider-management)
 - [Model Selection](#model-selection)
+- [Work Directory Switching (`/dir`, `/cd`)](#work-directory-switching-dir-cd)
 - [Feishu Setup CLI](#feishu-setup-cli)
+- [Weixin (personal) Setup CLI](#weixin-personal-setup-cli)
 - [Claude Code Router Integration](#claude-code-router-integration)
 - [Voice Messages (STT)](#voice-messages-speech-to-text)
 - [Voice Reply (TTS)](#voice-reply-text-to-speech)
@@ -35,6 +37,7 @@ Each user gets an independent session with full conversation context. Manage ses
 | `/usage` | Show account/model quota usage (if supported) |
 | `/provider [...]` | Manage API providers |
 | `/model [switch <alias>]` | List available models or switch by alias |
+| `/dir [path]` | Show or switch the agent work directory |
 | `/allow <tool>` | Pre-allow a tool (next session) |
 | `/reasoning [level]` | View or switch reasoning effort (Codex) |
 | `/mode [name]` | View or switch permission mode |
@@ -225,6 +228,38 @@ When `models` is configured, `/model` shows exactly that list without making an 
 
 ---
 
+## Work Directory Switching (`/dir`, `/cd`)
+
+Switch where the next agent session starts, directly from chat.
+
+### Chat Commands
+
+```
+/dir                    Show current work directory and recent history
+/dir <path>             Switch to a path (relative or absolute)
+/dir <number>           Switch to a directory from history
+/dir -                  Switch back to previous directory
+/dir help               Show command usage
+/cd <path>              Backward-compatible alias of /dir <path>
+```
+
+### Behavior Notes
+
+- Directory changes apply to the next session in the current project.
+- Relative paths are resolved from the current agent work directory.
+- Directory history is project-scoped and can be switched by index.
+- `/cd` is kept for compatibility, but `/dir` is the primary command.
+
+Examples:
+
+```text
+/dir ../another-repo
+/dir 2
+/dir -
+```
+
+---
+
 ## Feishu Setup CLI
 
 Use CLI to create or bind Feishu/Lark bot credentials and write them back to `config.toml`.
@@ -250,6 +285,26 @@ Behavior:
 - If project exists but has no `feishu/lark` platform, one is added automatically.
 - The command writes credentials (`app_id`, `app_secret`); in QR onboarding flow, Feishu usually pre-configures permissions and event subscriptions.
 - Still verify app publish status and availability scope in Feishu Open Platform.
+
+---
+
+## Weixin (personal) Setup CLI
+
+Weixin personal chat uses the **ilink bot HTTP API** (long polling + `sendMessage`, same family as OpenClaw `openclaw-weixin`). Use the CLI to scan a QR code or bind an existing Bearer token and write `config.toml`.
+
+**Full walkthrough (Chinese): [docs/weixin.md](./weixin.md).**
+
+```bash
+cc-connect weixin setup --project my-project
+cc-connect weixin bind --project my-project --token '<token>'
+cc-connect weixin new --project my-project
+```
+
+Notes:
+- `setup` without `--token` runs QR login; with `--token` behaves like bind.
+- Auto-creates the project and/or a `weixin` platform block when missing.
+- After login, send a message from WeChat once so `context_token` is cached.
+- See `cc-connect weixin help` for flags (`--api-url`, `--cdn-url`, `--route-tag`, etc.).
 
 ---
 
@@ -557,7 +612,7 @@ mode = "default"
 provider = "anthropic"
 
 [[projects.platforms]]
-type = "feishu"  # or dingtalk, telegram, slack, discord, wecom, line, qq, qqbot
+type = "feishu"  # or dingtalk, telegram, slack, discord, wecom, weixin, line, qq, qqbot
 
 [projects.platforms.options]
 # platform-specific options

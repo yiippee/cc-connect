@@ -65,6 +65,9 @@ func main() {
 		case "feishu":
 			runFeishu(os.Args[2:])
 			return
+		case "weixin":
+			runWeixin(os.Args[2:])
+			return
 		}
 	}
 
@@ -125,6 +128,7 @@ func main() {
 	setupLogger(cfg.Log.Level, logWriter)
 
 	engines := make([]*core.Engine, 0, len(cfg.Projects))
+	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
 
 	for _, proj := range cfg.Projects {
 		agent, err := core.CreateAgent(proj.Agent.Type, proj.Agent.Options)
@@ -155,7 +159,13 @@ func main() {
 
 		var platforms []core.Platform
 		for _, pc := range proj.Platforms {
-			p, err := core.CreatePlatform(pc.Type, pc.Options)
+			opts := make(map[string]any, len(pc.Options)+2)
+			for k, v := range pc.Options {
+				opts[k] = v
+			}
+			opts["cc_data_dir"] = cfg.DataDir
+			opts["cc_project"] = proj.Name
+			p, err := core.CreatePlatform(pc.Type, opts)
 			if err != nil {
 				slog.Error("failed to create platform", "project", proj.Name, "type", pc.Type, "error", err)
 				os.Exit(1)
@@ -164,7 +174,9 @@ func main() {
 		}
 
 		workDir, _ := proj.Agent.Options["work_dir"].(string)
-		sessionFile := sessionStorePath(cfg.DataDir, proj.Name, workDir)
+		projectState := core.NewProjectStateStore(projectStatePath(cfg.DataDir, proj.Name))
+		effectiveWorkDir := applyProjectStateOverride(proj.Name, agent, workDir, projectState)
+		sessionFile := sessionStorePath(cfg.DataDir, proj.Name, effectiveWorkDir)
 
 		// Parse language setting
 		var lang core.Language
@@ -184,7 +196,14 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		showCtx := true
+		if proj.ShowContextIndicator != nil {
+			showCtx = *proj.ShowContextIndicator
+		}
+		engine.SetShowContextIndicator(showCtx)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
+		engine.SetBaseWorkDir(workDir)
+		engine.SetProjectStateStore(projectState)
 
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
@@ -491,6 +510,7 @@ func main() {
 		})
 
 		engines = append(engines, engine)
+		effectiveWorkDirs = append(effectiveWorkDirs, effectiveWorkDir)
 	}
 
 	// Start cron scheduler
@@ -515,8 +535,7 @@ func main() {
 	for i, proj := range cfg.Projects {
 		hbCfg := buildHeartbeatConfig(proj.Heartbeat)
 		if hbCfg.Enabled {
-			workDir, _ := proj.Agent.Options["work_dir"].(string)
-			heartbeatSched.Register(proj.Name, hbCfg, engines[i], workDir)
+			heartbeatSched.Register(proj.Name, hbCfg, engines[i], effectiveWorkDirs[i])
 		}
 		engines[i].SetHeartbeatScheduler(heartbeatSched)
 	}
@@ -626,7 +645,7 @@ func main() {
 			e.SetDirHistory(dirHistory)
 
 			// Ensure initial work_dir is in history
-			if initWorkDir, _ := cfg.Projects[i].Agent.Options["work_dir"].(string); initWorkDir != "" {
+			if initWorkDir := effectiveWorkDirs[i]; initWorkDir != "" {
 				if !dirHistory.Contains(cfg.Projects[i].Name, initWorkDir) {
 					dirHistory.Add(cfg.Projects[i].Name, initWorkDir)
 				}
@@ -744,6 +763,56 @@ func sessionStorePath(dataDir, name, workDir string) string {
 	return filepath.Join(dataDir, "sessions", filename)
 }
 
+func projectStatePath(dataDir, projectName string) string {
+	replacer := strings.NewReplacer(
+		"\\", "_",
+		"/", "_",
+		":", "_",
+		"*", "_",
+		"?", "_",
+		"\"", "_",
+		"<", "_",
+		">", "_",
+		"|", "_",
+	)
+	name := strings.TrimSpace(projectName)
+	name = replacer.Replace(name)
+	if name == "" {
+		name = "project"
+	}
+	return filepath.Join(dataDir, "projects", name+".state.json")
+}
+
+func applyProjectStateOverride(projectName string, agent core.Agent, configuredWorkDir string, store *core.ProjectStateStore) string {
+	effectiveWorkDir := configuredWorkDir
+	if store == nil {
+		return effectiveWorkDir
+	}
+
+	switcher, ok := agent.(core.WorkDirSwitcher)
+	if !ok {
+		return effectiveWorkDir
+	}
+
+	override := store.WorkDirOverride()
+	if override == "" {
+		return effectiveWorkDir
+	}
+	if abs, err := filepath.Abs(override); err == nil {
+		override = abs
+	}
+
+	info, err := os.Stat(override)
+	if err != nil || !info.IsDir() {
+		slog.Warn("project_state: ignoring invalid work_dir override", "project", projectName, "work_dir", override)
+		return effectiveWorkDir
+	}
+
+	switcher.SetWorkDir(override)
+	slog.Info("project_state: applied work_dir override", "project", projectName, "work_dir", override)
+	return override
+}
+
 // resolveConfigPath determines which config file to use.
 // Priority: explicit flag → ./config.toml → ~/.cc-connect/config.toml
 func resolveConfigPath(explicit string) string {
@@ -815,7 +884,7 @@ func printUsage() {
 
   Bridge your messaging platforms to local AI coding agents.
   Supports: Claude Code, Codex, Cursor, Gemini CLI, Qoder CLI, OpenCode
-  Platforms: Feishu, Telegram, Slack, DingTalk, Discord, LINE, WeChat Work, QQ, QQ Bot
+  Platforms: Feishu, Telegram, Slack, DingTalk, Discord, LINE, WeChat Work, Weixin, QQ, QQ Bot
 
   GitHub:  https://github.com/chenhg5/cc-connect
   Docs:    https://github.com/chenhg5/cc-connect/blob/main/INSTALL.md
@@ -865,6 +934,11 @@ Commands:
     new              Force QR onboarding to create a new bot
     bind             Bind existing app_id/app_secret
 
+  weixin             Setup Weixin personal (ilink) via QR or token
+    setup            QR login, or bind when --token is provided
+    new              Force QR login
+    bind             Bind existing ilink bot token
+
   update             Check for updates and upgrade the binary (--pre for beta)
   check-update       Check if a newer version is available
   config-example     Print a complete annotated config.toml example
@@ -877,6 +951,7 @@ Examples:
   cc-connect send -m "hello"          Send a message to the active session
   cc-connect cron list                List all scheduled tasks
   cc-connect feishu setup             Setup Feishu/Lark bot credentials
+  cc-connect weixin setup             Setup Weixin (ilink) with QR or --token
   cc-connect update                   Update to the latest version
   cc-connect config-example           Print full config.toml example
   cc-connect config-example > c.toml  Save example config to a file
@@ -960,6 +1035,12 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
+
+	showCtx := true
+	if proj.ShowContextIndicator != nil {
+		showCtx = *proj.ShowContextIndicator
+	}
+	engine.SetShowContextIndicator(showCtx)
 
 	// Reload sender injection
 	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
