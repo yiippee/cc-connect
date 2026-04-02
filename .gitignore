@@ -52,6 +52,8 @@ dist/
 build/
 bin/
 release/
+!web/dist/
+!web/dist/.keep
 
 # ============================================================================
 # Testing & temporary files
